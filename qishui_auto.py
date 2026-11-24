@@ -12,6 +12,7 @@
 声明：只点击界面上真实存在的按钮，不修改 App、不伪造广告观看进度、不加速播放。
       广告该播多久还是多久，本脚本只负责替你点“领取奖励 / 继续观看 / 跳过”。
 """
+import json
 import os
 import re
 import subprocess
@@ -45,7 +46,7 @@ FUZZY = True                # 允许轻微识别误差
 POLL_INTERVAL = 0.1         # 每轮间隔（截图+OCR 本身约 0.8~1.5s）
 OCR_FALLBACK_INTERVAL = 2.5 # 保留：uiautomator 兜底时的最小间隔
 CLICK_COOLDOWN = 0.4        # 点击后冷却；同坐标重复点击由 do_click 的 3s 去重兜底
-MUTE_ON_START = False       # 默认不动音量；需要广告期间静音再改成 True
+MUTE_ON_START = True        # 开始运行就静音手机，停止后恢复原音量
 OCR_MAX_WIDTH = 720         # OCR 缩放宽度（太小会漏「取消」等小字，别低于 600）
 SAVE_CLICK_DEBUG = True     # 命中时保存标注截图
 DUMP_PATH = "/sdcard/qishui_dump.xml"
@@ -67,6 +68,35 @@ CENTER_TARGETS = {"领取奖励", "继续观看"}
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_clicks")
+PROFILE_PATH = os.path.join(SCRIPT_DIR, "device_profile.json")
+PROFILE = {}
+
+
+def load_profile():
+    """读取 device_profile.json：自定义机型名、分辨率、OCR 宽度、adb 路径、设备序列号。"""
+    global PROFILE
+    try:
+        with open(PROFILE_PATH, "r", encoding="utf-8") as f:
+            PROFILE = json.load(f) or {}
+    except Exception:
+        PROFILE = {}
+    return PROFILE
+
+
+def save_profile(data):
+    global PROFILE
+    PROFILE = dict(data or {})
+    try:
+        with open(PROFILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(PROFILE, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _profile_serial():
+    s = (PROFILE.get("serial") or "").strip()
+    return s
 
 click_seq = 0
 ocr_engine = None
@@ -80,10 +110,21 @@ last_click = {"target": None, "x": -1, "y": -1, "ts": 0.0}
 
 
 # ------------------------- adb 基础 -------------------------
+def adb_path():
+    """优先用本目录里的 platform-tools\\adb.exe，找不到再退回 PATH 里的 adb"""
+    local = os.path.join(SCRIPT_DIR, "platform-tools",
+                         "adb.exe" if os.name == "nt" else "adb")
+    return local if os.path.exists(local) else "adb"
+
+
 def adb(args, binary=False, timeout=20):
     """执行 adb 命令，失败/超时返回 None"""
     try:
-        r = subprocess.run(["adb"] + args, capture_output=True, timeout=timeout)
+        cmd = [adb_path()]
+        _sn = _profile_serial()
+        if _sn:
+            cmd += ["-s", _sn]
+        r = subprocess.run(cmd + args, capture_output=True, timeout=timeout)
         if r.returncode != 0:
             return None
         return r.stdout if binary else r.stdout.decode("utf-8", "ignore")
@@ -100,7 +141,15 @@ def screen_size():
         return screen_cache
     out = adb(["shell", "wm", "size"]) or ""
     ms = re.findall(r"(\d+)x(\d+)", out)
-    screen_cache = (int(ms[-1][0]), int(ms[-1][1])) if ms else (1080, 2400)
+    if ms:
+        screen_cache = (int(ms[-1][0]), int(ms[-1][1]))
+    else:
+        try:
+            _pw = int(PROFILE.get("width") or 0)
+            _ph = int(PROFILE.get("height") or 0)
+        except Exception:
+            _pw, _ph = 0, 0
+        screen_cache = (_pw or 1080, _ph or 2400)
     return screen_cache
 
 
@@ -174,6 +223,68 @@ def screenshot():
         h, w = img.shape[:2]
         set_screen_size(w, h)  # 以真实截图为准，避免 wm size 分辨率不一致
     return img
+
+
+FREE_DAYS_RE = re.compile(r"免费听\s*(\d+)\s*天")
+
+
+DAY_PATTERNS = [
+    re.compile(r"第\s*(\d+)\s*[日天]\s*免费听"),
+    re.compile(r"免费听\s*(\d+)\s*[日天]"),
+    re.compile(r"恭喜获得第\s*(\d+)\s*天"),
+    re.compile(r"已领取\s*第?\s*(\d+)\s*天"),
+]
+
+
+def sync_days(max_back=3):
+    """尽力读真实免费听天数：当前页读不到就往回退到首页读，读完再点「免费听」回到广告。"""
+    n = read_free_days()
+    if n is not None:
+        return n
+    for _ in range(max_back):
+        adb(["shell", "input", "keyevent", "4"])
+        time.sleep(0.9)
+        FOCUS_CACHE["ts"] = 0
+        n = read_free_days()
+        if n is not None:
+            return n
+    return None
+
+
+def parse_free_days(nodes):
+    """从 ocr_nodes 的结果里解析真实免费听天数，解析不到返回 None。"""
+    if not nodes:
+        return None
+    for row in nodes:
+        label = (row[0] or "")
+        for pat in DAY_PATTERNS:
+            m = pat.search(label)
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    pass
+    return None
+
+
+def read_free_days():
+    """从汽水音乐首页的「免费听N天」按钮读出真实天数；读不到返回 None。"""
+    screen = screenshot()
+    if screen is None:
+        return None
+    try:
+        nodes = ocr_nodes(screen)
+    except Exception:
+        return None
+    for row in nodes:
+        label = row[0]
+        m = FREE_DAYS_RE.search(normalize_text(label)) or FREE_DAYS_RE.search(label or "")
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+    return None
 
 
 def ocr_nodes(screen):
@@ -324,6 +435,15 @@ def try_cancel_live_enter(nodes, source):
             do_click(tx, n[2], "取消", n[0], source)
             return True
 
+    # 兜底：实测 OCR 会把「取消」两个字整段吞掉（只剩「4s后进入直播间」），
+    # 这时点不到按钮，用返回键把倒计时关掉，否则 4 秒后就被拖进直播间。
+    global last_back_ts
+    if time.time() - last_back_ts > 2.0:
+        last_back_ts = time.time()
+        print("  >>> 拦截「进入直播间」：识别不到「取消」，改用返回键")
+        adb(["shell", "input", "keyevent", "4"])
+        return True
+
     return False
 
 
@@ -372,41 +492,184 @@ def get_music_volume():
     return int(m.group(1)) if m else None
 
 
+AUDIO_STATE = os.path.join(SCRIPT_DIR, "audio_state.json")
+last_nonzero_volume = 8
+
+
+def _load_audio_state():
+    global last_nonzero_volume
+    try:
+        import json
+        with open(AUDIO_STATE, encoding="utf-8") as f:
+            v = int(json.load(f).get("last_nonzero", 8))
+        if 0 < v <= 15:
+            last_nonzero_volume = v
+    except Exception:
+        pass
+
+
+def _save_audio_state():
+    try:
+        import json
+        with open(AUDIO_STATE, "w", encoding="utf-8") as f:
+            json.dump({"last_nonzero": last_nonzero_volume}, f)
+    except Exception:
+        pass
+
+
+_load_audio_state()
+
+
 def toggle_mute():
-    # KEYCODE_VOLUME_MUTE：在“原音量”和 0 之间切换
+    # KEYCODE_VOLUME_MUTE：切换系统的静音开关（不是把索引设成 0）
     adb(["shell", "input", "keyevent", "164"])
 
 
+def set_music_volume(idx):
+    """直接把媒体音量索引设成 idx，并回读确认。成功返回 True。"""
+    try:
+        adb(["shell", "cmd", "media_session", "volume", "--stream", "3", "--set", str(int(idx))])
+    except Exception:
+        return False
+    time.sleep(0.15)
+    return get_music_volume() == int(idx)
+
+
 def mute_on_start():
-    global muted, saved_volume
+    global muted, saved_volume, last_nonzero_volume
     if not MUTE_ON_START:
         return
     v = get_music_volume()
     if v is None:
-        print("⚠️  读不到媒体音量，跳过自动静音（不影响点击）")
+        print("⚠️  读不到媒体音量，仍强制设为 0")
+        set_music_volume(0)
+        muted = True
         return
-    if v == 0:
-        print("🔇 当前已是静音，跳过")
+    if v > 0:
+        last_nonzero_volume = v
+        _save_audio_state()
+        saved_volume = v
+    else:
+        saved_volume = 0            # 启动时本来就静音：停止后恢复到上次非零音量
+    if set_music_volume(0):
+        muted = True
+        print(f"🔇 已静音（原音量 {saved_volume or last_nonzero_volume}，停止后恢复）")
         return
-    saved_volume = v
     toggle_mute()
     time.sleep(0.3)
-    if get_music_volume() == 0:
-        muted = True
-        print(f"🔇 已静音（原音量 {v}，退出时恢复）")
-    else:
-        print("⚠️  静音未生效，继续运行")
+    muted = get_music_volume() == 0
+    print("🔇 已静音（keyevent 164）" if muted else "⚠️  静音未生效，继续运行")
 
 
 def unmute():
-    global muted
-    if not muted:
-        return
-    # 只有当前确实是 0 才切回，避免把用户自己调过的音量又打开
-    if get_music_volume() == 0:
+    global muted, saved_volume
+    cur = get_music_volume()
+    target = saved_volume if (saved_volume or 0) > 0 else last_nonzero_volume
+    if cur is None:
+        pass
+    elif cur == target:
+        print(f"🔊 音量无需调整（{cur}）")
+    elif set_music_volume(target):
+        print(f"🔊 已恢复音量 {target}（原 {cur}）")
+    else:
         toggle_mute()
+        print("🔊 已恢复音量（keyevent 164）")
     muted = False
-    print("🔊 已恢复音量")
+    saved_volume = None
+
+
+# ------------------------- 直播间自救 -------------------------
+# 被带进直播间后，直播间里没有任何可领奖按钮，脚本会一直空转（实测挂了 23 分钟）。
+FOCUS_CACHE = {"ts": 0.0, "v": ""}
+last_back_ts = 0.0
+
+
+def current_focus():
+    """当前前台 Window/Activity，缓存 1.5s"""
+    now = time.time()
+    if now - FOCUS_CACHE["ts"] < 1.5:
+        return FOCUS_CACHE["v"]
+    out = adb(["shell", "dumpsys", "window"], timeout=10) or ""
+    m = re.search(r"mCurrentFocus=Window\{[^}]*?([\w.]+/[\w.$]+)", out)
+    v = m.group(1) if m else ""
+    FOCUS_CACHE.update(ts=now, v=v)
+    return v
+
+
+def in_live_room():
+    f = current_focus()
+    return ("LivePlayerActivity" in f) or (".live." in f and "Activity" in f)
+
+
+def _tap_free_listen():
+    """在首页找「免费听N天」按钮点进去，重新进入广告流程"""
+    for _ in range(6):
+        scr = screenshot()
+        if scr is None:
+            time.sleep(0.8)
+            continue
+        for n in ocr_nodes(scr):
+            if "免费听" in n[0]:
+                do_click(n[1], n[2], "免费听", n[0], "ocr", scr)
+                time.sleep(3.5)
+                return True
+        time.sleep(1.2)
+    return False
+
+
+def enter_next_ad():
+    """回到首页时接上下一条广告。
+    首页常挂着奖励弹窗（「恭喜获得第N天免费时长畅听」），弹窗是模态的，
+    直接点底下的「免费听」没用（实测会一直空转），必须按优先级：
+      1) 弹窗上的「再看1个」= 继续看下一条广告（不花钱，最安全）
+      2) 「免费听N天」= 从推荐页入口进
+      3) 都没有就按返回键把弹窗关掉再试
+    """
+    for attempt in range(4):
+        scr = screenshot()
+        if scr is None:
+            time.sleep(0.8)
+            continue
+        nodes = ocr_nodes(scr)
+        for n in nodes:
+            if "再看" in n[0]:
+                do_click(n[1], n[2], "再看", n[0], "ocr", scr)
+                time.sleep(3.0)
+                return True
+        for n in nodes:
+            if "免费听" in n[0]:
+                do_click(n[1], n[2], "免费听", n[0], "ocr", scr)
+                time.sleep(3.5)
+                return True
+        adb(["shell", "input", "keyevent", "4"])
+        time.sleep(0.9)
+    return False
+
+
+def restart_app():
+    """强制重启 App 并回到广告流程"""
+    adb(["shell", "am", "force-stop", "com.luna.music"])
+    time.sleep(1.2)
+    adb(["shell", "monkey", "-p", "com.luna.music", "-c",
+         "android.intent.category.LAUNCHER", "1"])
+    FOCUS_CACHE["ts"] = 0.0
+    time.sleep(6.0)
+    return _tap_free_listen()
+
+
+def escape_live_room():
+    """按返回键退出直播间；退不出就强制重启 App 并重新进入广告"""
+    for _ in range(2):
+        adb(["shell", "input", "keyevent", "4"])
+        FOCUS_CACHE["ts"] = 0.0
+        time.sleep(0.9)
+        if not in_live_room():
+            print("  ↩️  已退出直播间，继续监控")
+            return True
+    print("  ⚠️  返回键退不出直播间，强制重启 App 并重新进入广告")
+    ok = restart_app()
+    print("  ✅ 已重启并重新进入广告流程" if ok else "  ⚠️  重新进入广告失败，继续尝试")
+    return ok
 
 
 # ------------------------- 主循环 -------------------------
@@ -432,8 +695,24 @@ def main():
 
     mute_on_start()
     idle = 0
+    feeder_idle = 0
     try:
         while True:
+            # 直播间检测放最前面：被拖进直播间后这里永远等不到目标按钮
+            if in_live_room():
+                escape_live_room()
+                continue
+
+            # 停在首页（不在广告里）说明流程断了，重新点「免费听」进去
+            if "MainActivity" in current_focus():
+                feeder_idle += 1
+                if feeder_idle >= 3:
+                    print("· 检测到停在首页，重新点「免费听」进入广告")
+                    _tap_free_listen()
+                    feeder_idle = 0
+                continue
+            feeder_idle = 0
+
             clicked = False
 
             # 主通道：OCR。奖励弹窗等覆盖层 uiautomator 抓不到，必须靠 OCR

@@ -3,6 +3,9 @@ chcp 65001 >nul
 cd /d "%~dp0"
 title 汽水音乐自动看广告
 
+rem 优先使用本目录内的 platform-tools，免去手动配置 PATH
+if exist "%~dp0platform-tools\adb.exe" set "PATH=%~dp0platform-tools;%PATH%"
+
 echo ========================================
 echo   汽水音乐自动看广告
 echo ========================================

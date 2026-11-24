@@ -272,6 +272,11 @@ def worker():
     S.start_ts = time.time()
     try:
         while not S.stop_flag.is_set():
+            # 任何路径下只要手机实测天数够上限就收工
+            if cap_reached():
+                S.log("🎉 免费听已到上限 %d 天，自动停止挂机" % int(S.vip.get("cap", 30)), "ok")
+                break
+
             # 直播间检测：被拖进直播间后永远等不到目标按钮，必须主动逃出
             if q.in_live_room():
                 S.log("检测到进入直播间，正在退出…", "warn")
@@ -288,6 +293,10 @@ def worker():
             # 停在首页说明广告流程断了（常见：领完奖励弹「恭喜获得第N天」模态弹窗）
             if "MainActivity" in q.current_focus():
                 refresh_real_days()
+                if cap_reached():
+                    S.log("🎉 免费听已到上限 %d 天，自动停止挂机" % int(S.vip.get("cap", 30)), "ok")
+                    S.stop_flag.set()
+                    break
                 feeder_idle += 1
                 if feeder_idle >= 2:
                     feeder_idle = 0

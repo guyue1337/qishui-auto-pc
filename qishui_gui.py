@@ -10,6 +10,8 @@
 """
 import json
 import os
+import re
+import socket
 import sys
 import threading
 import time
@@ -102,6 +104,16 @@ def vip_estimate():
     cap = max(1, int(S.vip["cap"]))
     start = max(0, int(S.vip["start_days"]))
     return min(cap, start + int(S.vip["total"]) // per)
+
+
+def cap_reached():
+    """手机实测天数已经够上限了就不该再刷（用户设的上限，默认 30 天）"""
+    try:
+        cap = int(S.vip.get("cap", 30))
+        real = int(S.vip.get("real_days", -1))
+    except Exception:
+        return False
+    return cap > 0 and real >= 0 and real >= cap
 
 
 def refresh_real_days(force=False):
@@ -244,18 +256,33 @@ def worker():
     else:
         S.log("⚠️ 没读到手机上的天数，先用本地估算", "warn")
 
+    if cap_reached():
+        S.log("🎉 免费听已到上限 %d 天，不用再刷了" % int(S.vip.get("cap", 30)), "ok")
+        try:
+            q.unmute()
+        except Exception:
+            pass
+        S.running = False
+        return
+
     idle = 0
     feeder_idle = 0
     feed_tries = 0
+    live_fails = 0
     S.start_ts = time.time()
     try:
         while not S.stop_flag.is_set():
             # 直播间检测：被拖进直播间后永远等不到目标按钮，必须主动逃出
             if q.in_live_room():
                 S.log("检测到进入直播间，正在退出…", "warn")
-                q.escape_live_room()
+                ok = q.escape_live_room()
                 idle = 0
                 feeder_idle = 0
+                if ok:
+                    live_fails = 0
+                else:
+                    live_fails += 1
+                    time.sleep(min(15, 3 * live_fails))
                 continue
 
             # 停在首页说明广告流程断了（常见：领完奖励弹「恭喜获得第N天」模态弹窗）
@@ -293,6 +320,10 @@ def worker():
                         S.vip["real_days"] = int(n_day)
                         save_vip()
                         S.log("📱 读到了：免费听 %d 天" % n_day, "ok")
+                    if cap_reached():
+                        S.log("🎉 免费听已到上限 %d 天，自动停止挂机" % int(S.vip.get("cap", 30)), "ok")
+                        S.stop_flag.set()
+                        break
                     if q.match_and_click(nodes, "ocr", screen):
                         clicked = True
                 except Exception as e:
@@ -403,6 +434,13 @@ body::after{
   border:1px solid rgba(255,255,255,.9);box-shadow:inset 0 1px 0 #fff}
 .dot{width:6px;height:6px;border-radius:50%;background:#97a2c4}
 .dot.on{background:#12b76a;box-shadow:0 0 8px rgba(18,183,106,.65)}
+.dot.run{background:#7c9bff;box-shadow:0 0 8px rgba(124,155,255,.75);animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.qq{margin-top:2px;font-size:11px;letter-spacing:.4px;color:#5a6180;text-align:center;user-select:all}
+body.dark .qq{color:#7d86a6}
+.note{margin-top:10px;padding:8px 9px;border-radius:10px;font-size:10.5px;line-height:1.6;
+  color:#7a4a12;background:rgba(255,196,92,.16);border:1px solid rgba(255,180,60,.28)}
+body.dark .note{color:#e0b070;background:rgba(255,180,60,.09);border-color:rgba(255,180,60,.18)}
 
 /* ── 中列 ── */
 .main{display:flex;flex-direction:column;gap:12px;min-height:0}
@@ -549,9 +587,11 @@ body.dark .steps li::before{background:rgba(142,168,255,.20);color:#a9bdff}
       <li>点右侧「读取当前手机」→「保存参数」</li>
       <li>点「开始」，就能挂机了</li>
     </ol>
+    <div class="note">小米/红米还要开「USB调试（安全设置）」；华为/荣耀选「仅充电时允许调试」。换手机不用改代码，分辨率全按比例算。</div>
     <div class="bottom">
       <button class="themebtn" id="themebtn">切换亮色</button>
       <div class="chip"><span class="dot" id="dot"></span><span id="devtxt">正在检测设备…</span></div>
+      <div class="qq">QQ 2021106570</div>
     </div>
   </aside>
 
@@ -830,6 +870,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/profile":
             if "read=1" in self.path:
+                q.screen_cache = None          # 强制重新读 wm size，换手机时不会拿到旧值
+                q._auto_serial["ts"] = 0.0     # 顺便重新枚举设备
                 w, h = q.screen_size()
                 dev = S.device or {}
                 return self._send(200, json.dumps({"width": w, "height": h,
@@ -878,6 +920,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/profile":
             ok = q.save_profile(data)
+            q.screen_cache = None
             try:
                 if data.get("ocr_width"):
                     q.OCR_MAX_WIDTH = int(data["ocr_width"])
@@ -919,16 +962,45 @@ def main():
 
     load_vip()
     S.log("控制台已启动", "ok")
+
+    # ---- 环境自检：换电脑/换手机时，缺什么直接写在日志里 ----
+    try:
+        ap = q.adb_path()
+        if ap == "adb" or not os.path.exists(ap):
+            S.log("没找到 adb.exe：请确认 platform-tools 目录完整，或在右侧「ADB」填绝对路径", "error")
+        else:
+            S.log(f"adb：{ap}", "dim")
+        ver = q.adb(["version"]) or ""
+        m = re.search(r"version\s+([\d.]+)", ver)
+        if m:
+            S.log(f"adb 版本：{m.group(1)}", "dim")
+        else:
+            S.log("adb 无法执行：检查数据线、驱动，或手机是否点了「允许调试」", "warn")
+    except Exception as e:
+        S.log(f"环境自检异常：{e}", "warn")
+
     if detect_device():
-        S.log(f"设备：{S.device.get('model')}  {S.device.get('w')}×{S.device.get('h')}", "ok")
+        S.log(f"设备：{S.device.get('model')}  {S.device.get('w')}×{S.device.get('h')}  Android {S.device.get('android')}", "ok")
     else:
         S.log("未检测到设备，请插好 USB 并允许调试", "warn")
     S.log(f"免费听天数：预计 {vip_days()} 天（累计 {S.vip['total']} 条，上限 {S.vip['cap']} 天）", "info")
 
     threading.Thread(target=preview_worker, daemon=True).start()
 
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    url = f"http://127.0.0.1:{PORT}/"
+    port = PORT
+    for p in range(PORT, PORT + 12):
+        try:
+            with socket.socket() as sk:
+                sk.bind(("127.0.0.1", p))
+            port = p
+            break
+        except OSError:
+            continue
+    if port != PORT:
+        S.log(f"端口 {PORT} 被占用，已改用 {port}", "warn")
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{port}/"
     print(f"\n  控制台已就绪 -> {url}")
     print("  关闭这个窗口即退出\n")
     try:

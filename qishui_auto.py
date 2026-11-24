@@ -15,6 +15,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -110,21 +111,96 @@ last_click = {"target": None, "x": -1, "y": -1, "ts": 0.0}
 
 
 # ------------------------- adb 基础 -------------------------
+_NOWIN = {}
+if os.name == "nt":
+    _NOWIN["creationflags"] = 0x08000000  # CREATE_NO_WINDOW，避免每次调用闪黑框
+
+
 def adb_path():
-    """优先用本目录里的 platform-tools\\adb.exe，找不到再退回 PATH 里的 adb"""
-    local = os.path.join(SCRIPT_DIR, "platform-tools",
-                         "adb.exe" if os.name == "nt" else "adb")
-    return local if os.path.exists(local) else "adb"
+    """按优先级找 adb，换电脑/换手机都不会缺驱动：
+    1) 控制台里手填的路径（device_profile.json 的 adb 字段）
+    2) 本目录自带的 platform-tools\\adb.exe
+    3) 系统 PATH 里的 adb
+    4) 常见的 Android SDK / 模拟器安装位置
+    """
+    exe = "adb.exe" if os.name == "nt" else "adb"
+
+    p = (PROFILE.get("adb") or "").strip().strip('"')
+    if p:
+        p = os.path.expandvars(os.path.expanduser(p))
+        if os.path.isdir(p):
+            p = os.path.join(p, exe)
+        if os.path.exists(p):
+            return p
+
+    for cand in (
+        os.path.join(SCRIPT_DIR, "platform-tools", exe),
+        os.path.join(SCRIPT_DIR, "platform-tools", "platform-tools", exe),
+    ):
+        if os.path.exists(cand):
+            return cand
+
+    found = shutil.which("adb")
+    if found:
+        return found
+
+    home = os.path.expanduser("~")
+    cands = []
+    if os.name == "nt":
+        cands += [
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk", "platform-tools", exe),
+            os.path.join(home, "AppData", "Local", "Android", "Sdk", "platform-tools", exe),
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Nox", "bin", "adb.exe"),
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "BlueStacks_nxt", "HD-Adb.exe"),
+            r"C:\platform-tools\adb.exe",
+            r"D:\platform-tools\adb.exe",
+            r"C:\Android\platform-tools\adb.exe",
+            r"D:\Android\platform-tools\adb.exe",
+        ]
+    for c in cands:
+        if c and os.path.exists(c):
+            return c
+    return "adb"
+
+
+def _raw_adb(args, binary=False, timeout=20):
+    """不带 -s 的底层调用（用于自己枚举设备）"""
+    try:
+        r = subprocess.run([adb_path()] + args, capture_output=True, timeout=timeout, **_NOWIN)
+        if r.returncode != 0:
+            return None
+        return r.stdout if binary else r.stdout.decode("utf-8", "ignore")
+    except Exception:
+        return None
+
+
+_auto_serial = {"v": None, "ts": 0.0}
+
+
+def _any_serial():
+    """没填序列号时，自动挑第一台在线设备；多台设备也能用"""
+    now = time.time()
+    if _auto_serial["v"] and now - _auto_serial["ts"] < 30:
+        return _auto_serial["v"]
+    out = _raw_adb(["devices"]) or ""
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            _auto_serial["v"] = parts[0]
+            _auto_serial["ts"] = now
+            return parts[0]
+    _auto_serial["v"] = None
+    return None
 
 
 def adb(args, binary=False, timeout=20):
     """执行 adb 命令，失败/超时返回 None"""
     try:
         cmd = [adb_path()]
-        _sn = _profile_serial()
-        if _sn:
-            cmd += ["-s", _sn]
-        r = subprocess.run(cmd + args, capture_output=True, timeout=timeout)
+        sn = "" if (args and args[0] == "devices") else (_profile_serial() or _any_serial())
+        if sn:
+            cmd += ["-s", sn]
+        r = subprocess.run(cmd + args, capture_output=True, timeout=timeout, **_NOWIN)
         if r.returncode != 0:
             return None
         return r.stdout if binary else r.stdout.decode("utf-8", "ignore")
@@ -596,19 +672,73 @@ def current_focus():
     return v
 
 
+LIVE_HINTS = ("更多直播", "说点什么", "在线观众", "直播间人数", "点亮", "送礼物", "直播中")
+
+
 def in_live_room():
-    f = current_focus()
-    return ("LivePlayerActivity" in f) or (".live." in f and "Activity" in f)
+    """前台 Activity 判断直播间。Honor 上是 LunaDefaultLivePlayerActivity，
+    其它机型可能是 LiveRoomActivity / 插件里的 live 页面，统一按关键字匹配。"""
+    f = (current_focus() or "").lower()
+    if not f:
+        return False
+    if "liveplayer" in f or "liveroom" in f or "livelist" in f:
+        return True
+    if ".live." in f and "activity" in f:
+        return True
+    return False
+
+
+def _live_text_visible():
+    """焦点读不到时用画面文字兜底：同时出现两个直播间专属文案就算在直播间"""
+    scr = screenshot()
+    if scr is None:
+        return False
+    hit = 0
+    for n in ocr_nodes(scr):
+        t = n[0]
+        if any(h in t for h in LIVE_HINTS):
+            hit += 1
+            if hit >= 2:
+                return True
+    return False
+
+
+def _back():
+    adb(["shell", "input", "keyevent", "4"])
+    FOCUS_CACHE["ts"] = 0.0
+    time.sleep(0.8)
+
+
+def _tap_live_close():
+    """直播间右上角一般有 × / 关闭，先点它"""
+    scr = screenshot()
+    if scr is None:
+        return False
+    _w, h = screen_size()
+    for n in ocr_nodes(scr):
+        t = n[0].replace(" ", "")
+        if t in ("关闭", "×", "✕", "退出", "退出直播间") and n[2] < h * 0.22:
+            do_click(n[1], n[2], "直播间关闭", n[0], "ocr", scr)
+            time.sleep(1.0)
+            return True
+    return False
 
 
 def _tap_free_listen():
-    """在首页找「免费听N天」按钮点进去，重新进入广告流程"""
+    """在首页找「免费听N天」按钮点进去，重新进入广告流程；
+    有「再看1个」奖励弹窗时优先点它（模态弹窗会挡住底下的按钮）。"""
     for _ in range(6):
         scr = screenshot()
         if scr is None:
             time.sleep(0.8)
             continue
-        for n in ocr_nodes(scr):
+        nodes = ocr_nodes(scr)
+        for n in nodes:
+            if "再看" in n[0]:
+                do_click(n[1], n[2], "再看", n[0], "ocr", scr)
+                time.sleep(3.0)
+                return True
+        for n in nodes:
             if "免费听" in n[0]:
                 do_click(n[1], n[2], "免费听", n[0], "ocr", scr)
                 time.sleep(3.5)
@@ -647,28 +777,70 @@ def enter_next_ad():
 
 
 def restart_app():
-    """强制重启 App 并回到广告流程"""
-    adb(["shell", "am", "force-stop", "com.luna.music"])
-    time.sleep(1.2)
+    """强制重启 App 并回到广告流程。
+    关键：force-stop 后要确认进程真的没了，否则 monkey 只是把原来的
+    直播间任务重新拉到前台，看起来就像「重启了还在直播间」。"""
+    for _ in range(2):
+        adb(["shell", "am", "force-stop", "com.luna.music"])
+        time.sleep(1.6)
+        pid = (adb(["shell", "pidof", "com.luna.music"]) or "").strip()
+        if not pid:
+            break
+        adb(["shell", "am", "force-stop", "--user", "0", "com.luna.music"])
+        time.sleep(1.6)
+
     adb(["shell", "monkey", "-p", "com.luna.music", "-c",
          "android.intent.category.LAUNCHER", "1"])
     FOCUS_CACHE["ts"] = 0.0
-    time.sleep(6.0)
+    time.sleep(7.0)
+
+    # 有些广告会在启动后 4 秒自动跳直播间，再杀一次
+    if in_live_room():
+        adb(["shell", "am", "force-stop", "com.luna.music"])
+        time.sleep(1.6)
+        adb(["shell", "monkey", "-p", "com.luna.music", "-c",
+             "android.intent.category.LAUNCHER", "1"])
+        FOCUS_CACHE["ts"] = 0.0
+        time.sleep(7.0)
+
     return _tap_free_listen()
 
 
 def escape_live_room():
-    """按返回键退出直播间；退不出就强制重启 App 并重新进入广告"""
-    for _ in range(2):
-        adb(["shell", "input", "keyevent", "4"])
-        FOCUS_CACHE["ts"] = 0.0
-        time.sleep(0.9)
+    """退出直播间，四层兜底：
+    ① 返回键 ×3 ② 右上角「关闭 / ×」 ③ 左边缘侧滑 ④ 强杀重启 App。
+    实测这个 App 的直播间经常把返回键吞掉，所以不能只按两次就放弃。"""
+    for _ in range(3):
+        _back()
         if not in_live_room():
             print("  ↩️  已退出直播间，继续监控")
             return True
-    print("  ⚠️  返回键退不出直播间，强制重启 App 并重新进入广告")
+
+    if _tap_live_close():
+        FOCUS_CACHE["ts"] = 0.0
+        time.sleep(1.0)
+        if not in_live_room():
+            print("  ↩️  点关闭按钮退出直播间")
+            return True
+
+    try:
+        w, h = screen_size()
+        adb(["shell", "input", "swipe", "2", str(h // 2),
+             str(int(w * 0.6)), str(h // 2), "220"])
+        FOCUS_CACHE["ts"] = 0.0
+        time.sleep(1.0)
+        if not in_live_room():
+            print("  ↩️  侧滑退出直播间")
+            return True
+    except Exception:
+        pass
+
+    if _live_text_visible():
+        print("  ⚠️  画面仍是直播间，直接强杀 App")
+
+    print("  ⚠️  退不出直播间，强制重启 App")
     ok = restart_app()
-    print("  ✅ 已重启并重新进入广告流程" if ok else "  ⚠️  重新进入广告失败，继续尝试")
+    print("  ✅ 已重启并重新进入广告流程" if ok else "  ⚠️  重新进入广告失败，下一轮继续重试")
     return ok
 
 

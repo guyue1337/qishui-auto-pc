@@ -3,3 +3,5 @@
 opencv-python>=4.8
 numpy>=1.24
 rapidocr-onnxruntime>=1.3
+cryptography>=42
+pymobiledevice3>=11.63,<12

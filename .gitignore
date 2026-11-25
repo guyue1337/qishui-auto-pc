@@ -11,13 +11,30 @@ __pycache__/
 # 本机运行状态（每台机器自己生成，别提交）
 vip_state.json
 audio_state.json
+device_profile.local.json
+
+# 私有发布资源（仅保留在本机，不进入仓库）
+private/
+support/
+reward/
 
 # 打包产物 / 第三方工具（体积大，走 Release 附件，不进仓库）
 dist/
 platform-tools/
+packaging/cache/
 发布到GitHub.ps1
 _pkgtest*/
 
-# ����ʱ��־
+# 临时日志
 _run_*.log
 _gui.pid
+$null
+test_console.*
+
+# 本机调试脚本与抓取结果
+/_*.py
+!/_build_package.py
+/_*.txt
+/_*.js
+/_*.log
+/_*.pid

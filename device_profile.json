@@ -1,6 +1,35 @@
 {
-  "name": "HONOR TFY-AN00",
-  "width": 1080,
-  "height": 2388,
-  "ocr_width": 720
+  "platform": "android",
+  "name": "",
+  "width": 0,
+  "height": 0,
+  "ocr_width": 720,
+  "adb": "",
+  "serial": "",
+  "ios_wda": "http://127.0.0.1:8100",
+  "ios_bundle": "com.soda.music",
+  "profiles": {
+    "android": {
+      "platform": "android",
+      "name": "",
+      "width": 0,
+      "height": 0,
+      "ocr_width": 720,
+      "adb": "",
+      "serial": "",
+      "ios_wda": "http://127.0.0.1:8100",
+      "ios_bundle": "com.soda.music"
+    },
+    "ios": {
+      "platform": "ios",
+      "name": "",
+      "width": 0,
+      "height": 0,
+      "ocr_width": 720,
+      "adb": "",
+      "serial": "",
+      "ios_wda": "http://127.0.0.1:8100",
+      "ios_bundle": "com.soda.music"
+    }
+  }
 }

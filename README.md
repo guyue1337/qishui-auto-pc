@@ -25,7 +25,7 @@
 ## 下载与启动
 
 1. 打开 [Releases](https://github.com/guyue1337/qishui-music-automation/releases/latest)
-2. 下载最新的 `汽水音乐自动化-便携版.zip`
+2. 下载 Release 中最新的 `qishui-music-automation-v*-portable.zip`
 3. 完整解压到硬盘，不要直接在压缩包内运行
 4. 双击 `一键启动.bat`
 5. 浏览器打开控制台后，选择设备平台并读取手机

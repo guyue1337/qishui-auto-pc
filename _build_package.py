@@ -18,10 +18,10 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parent
 DIST = SRC / "dist" / "汽水音乐自动化"
-ZIP = SRC / "dist" / "汽水音乐自动化-便携版.zip"
 PYTHON = DIST / "python" / "python.exe"
 ADB = DIST / "platform-tools" / "adb.exe"
 APP_VERSION = "1.2.0"
+ZIP = SRC / "dist" / f"qishui-music-automation-v{APP_VERSION}-portable.zip"
 SUPPORT_SRC = SRC / "private" / "support"
 SUPPORT_DIST = DIST / "support"
 SUPPORT_SIGNING_KEY = SRC / "private" / "support-signing.key"

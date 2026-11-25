@@ -1,0 +1,27 @@
+iPhone WDA 免费自签测试包
+================================
+
+适用：iPhone / iOS 17.0–26.x
+电脑：Windows 10 / 11
+
+文件说明
+1. iOS自签安装教程.webp：完整图文步骤
+2. WDA.ipa：拖进 Sideloadly 签名安装
+
+快速流程
+1. 安装 Apple Devices（Microsoft Store）或 iTunes。
+2. 从 https://sideloadly.io/ 安装 Sideloadly。
+3. iPhone 解锁并连接 USB，点“信任此电脑”。
+4. 把 WDA.ipa 拖进 Sideloadly，输入普通 Apple ID、密码和双重认证验证码，点 Start。
+5. iPhone：设置 → 通用 → VPN 与设备管理 → 信任该开发者。
+6. iPhone：设置 → 隐私与安全性 → 开发者模式 → 开启并重启。
+7. 打开汽水音乐自动化，读取 iPhone，进入 WDA 配置，检查状态后点“启动 WDA”。
+
+注意
+- 免费 Apple ID 签名通常约 7 天有效，到期用同一个 WDA.ipa 在 Sideloadly 重签。
+- 如果 Apple ID 被安全锁定，请到 https://iforgot.apple.com/ 解锁，或换另一个未锁定的 Apple ID。
+- 不要购买共享企业证书，也不要把 Apple ID 密码交给陌生签名网站。
+- 密码只在官方 Sideloadly 窗口输入；本项目不读取、不保存密码。
+
+WDA.ipa SHA-256
+9AFBC9611789F179575AF80A386CB5778EC84A09C3982F9C38DC52686AD87746

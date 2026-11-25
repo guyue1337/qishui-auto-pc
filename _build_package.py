@@ -20,7 +20,7 @@ SRC = Path(__file__).resolve().parent
 DIST = SRC / "dist" / "汽水音乐自动化"
 PYTHON = DIST / "python" / "python.exe"
 ADB = DIST / "platform-tools" / "adb.exe"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.4.0"
 ZIP = SRC / "dist" / f"qishui-music-automation-v{APP_VERSION}-portable.zip"
 SUPPORT_SRC = SRC / "private" / "support"
 SUPPORT_DIST = DIST / "support"
@@ -35,19 +35,24 @@ README = """汽水音乐自动脚本·便携版使用说明
 
 【支持的手机】
   · Android 7.0 以上：USB 调试 + ADB
-  · iPhone iOS 17.4 以上：USB 免签直连，不装证书、不越狱
+  · iPhone iOS 27.0 及以上：USB 免签直连，不装证书、不越狱
+  · iPhone iOS 17.0–26.x：控制台内按向导一键安装 WebDriverAgent（WDA）
+  · iPhone iOS 16 及以下：暂不支持，建议先升级系统
   · 电脑：Windows 10 / 11 64 位
 
 【包内已经集成，不用另装】
   Python 3.11、adb / platform-tools、OpenCV、ONNX Runtime、
   RapidOCR 中文模型、pymobiledevice3（iPhone CoreDevice）、
   cryptography、VC++ 运行库、驱动助手、启动器和界面资源。
+  iPhone 17–26 的 WDA 签名与运行组件会在首次配置时联网下载并校验。
 
 【第一次使用】
   1. 把整个 zip 解压到硬盘，不要直接在压缩包里运行。
   2. 双击「一键启动.bat」。
-  3. 启动器会自检 Python、OCR、adb 和 iPhone 驱动。
-  4. 浏览器会自动打开控制台。
+  3. 首次启动会检查系统、Python 运行库、adb 和 iPhone 驱动。
+  4. 按向导选择 Android 或 iPhone，查看对应的连接步骤。
+  5. 以后可双击「连接向导.bat」重新打开环境与驱动检查。
+  6. 浏览器会自动打开控制台。
 
 【Android 连接】
   1. 设置 → 关于手机 → 连续点版本号，开启开发者选项。
@@ -65,13 +70,34 @@ README = """汽水音乐自动脚本·便携版使用说明
   3. 设置 → 隐私与安全性 → 开发者模式 → 打开并重启手机。
   4. 控制台顶部选 iPhone → 读取 iPhone → 开始。
   5. 首次点开始会自动准备 Apple 开发者组件，需要联网，可能需要几分钟。
-     不需要证书、不需要签名、不需要越狱；iOS 17.4+ 走 CoreDevice 免签直连。
+     不需要证书、不需要签名、不需要越狱；iOS 27.0 及以上走免签直连。
+     iOS 17.0–26.x 会自动弹出兼容向导：
+       ① 打开 Apple ID 登录入口，在 Impactor 窗口完成登录；
+       ② 点「安装 / 续签 WDA」；
+       ③ 点「启动 WDA」，显示已就绪后返回开始任务。
+     免费 Apple ID 签名通常约 7 天有效，到期后在向导中一键续签。
+     Apple ID 密码只在 Impactor 窗口输入，本程序不读取、不保存密码。
+     iOS 16 及以下未纳入当前兼容范围。
   6. 汽水音乐需要已经安装并登录（Bundle: com.soda.music）。
+
+【iOS 17.0–26.x 手动签名备选】
+  如果 Impactor 登录不稳定，可以使用随包 assets\\ios\\WDA.ipa：
+  1. 从 https://sideloadly.io/ 安装 Sideloadly。
+  2. iPhone 解锁并连接 USB，点「信任此电脑」。
+  3. 把 assets\\ios\\WDA.ipa 拖入 Sideloadly。
+  4. 输入一个可正常登录的免费 Apple ID、密码和双重认证验证码，点 Start。
+  5. 设置 → 通用 → VPN 与设备管理 → 信任该开发者。
+  6. 设置 → 隐私与安全性 → 开发者模式 → 开启并重启。
+  7. 回控制台 → iPhone → WDA 配置 → 检查状态 → 启动 WDA。
+  免费签名通常约 7 天有效，到期用同一个 WDA.ipa 在 Sideloadly 重新签名。
+  详细图文：assets\\ios\\iOS自签安装教程.webp
 
 【界面参数】
   OCR宽：截图缩放到这个宽度再识别。720 通用；
          识别不准可调 800，电脑/手机卡顿可调 640。
-  旧版WDA：只有 iOS 17 以下兼容模式才用，新系统不用改。
+  广告极速：默认开启，优先识别跳过按钮并减少无效扫描；
+          遇到个别广告识别不到按钮时可临时关闭，回退完整扫描。
+  WDA地址：默认 http://127.0.0.1:8100，由兼容向导自动配置。
   Bundle：iOS 应用标识，汽水音乐为 com.soda.music。
 
 【常见问题】
@@ -80,6 +106,10 @@ README = """汽水音乐自动脚本·便携版使用说明
     设备管理器有黄色感叹号时安装手机厂商 USB 驱动。
   · iPhone 读不到：确认 Apple 驱动服务已安装、手机已信任电脑、
     开发者模式已开启。
+  · 提示 iOS 17.0–26.x 需要 WDA：这是 Apple CoreDevice 的系统限制。
+    在控制台打开「旧版 iPhone 兼容通道」，按向导登录、安装、启动。
+  · WDA 提示签名过期：免费签名通常约 7 天，重新点「安装 / 续签 WDA」。
+  · Apple ID 输入：只在打开的 Impactor 登录窗口内输入，程序不接触密码。
   · 端口被占用：程序会自动换端口，看控制台窗口打印的地址。
   · 首次 iPhone 准备很慢：Apple 开发者组件需要下载，之后会快很多。
   · 天数显示 --：广告页没有「第N日免费听」时读不到，开始运行后会自动补。
@@ -95,7 +125,6 @@ README = """汽水音乐自动脚本·便携版使用说明
   完整条款见包内 LICENSE 文件。
 
 作者：guyue1337
-联系方式：QQ 2021106570
 GitHub：https://github.com/guyue1337
 """
 
@@ -127,6 +156,20 @@ if not exist "%~dp0python\\python.exe" (
 )
 "%~dp0python\\python.exe" "%~dp0launcher.py" --check
 pause
+"""
+
+SETUP_BAT = """@echo off
+chcp 65001 >nul
+setlocal
+title Qishui First Run Setup
+cd /d "%~dp0"
+set "PATH=%~dp0;%~dp0python;%~dp0python\\Scripts;%~dp0platform-tools;%PATH%"
+if not exist "%~dp0python\\python.exe" (
+  echo [ERROR] Bundled Python not found. Please extract the whole zip again.
+  pause
+  exit /b 1
+)
+"%~dp0python\\python.exe" "%~dp0launcher.py" --setup
 """
 
 IPHONE_DRIVER_BAT = """@echo off
@@ -173,7 +216,12 @@ DRIVERS_README = """驱动说明
   安装后重新插线，并在手机上点「允许 USB 调试」。
 
 二、iPhone
-  iOS 17.4+ 不需要证书、不需要 WebDriverAgent。
+  iOS 27.0 及以上不需要证书、也不需要 WebDriverAgent。
+  iOS 17.0–26.x 在控制台内按「旧版 iPhone 兼容通道」向导安装 WDA。
+  免费 Apple ID 签名通常约 7 天，到期后在同一个向导内续签。
+  如果内置登录入口不稳定，可用 assets\\ios\\WDA.ipa + Sideloadly 手动签名；
+  图文步骤见 assets\\ios\\iOS自签安装教程.webp。
+  iOS 16 及以下暂不支持。
   电脑必须安装 Apple Mobile Device Service，它随 iTunes 或 Apple Devices 安装。
 
   推荐操作：
@@ -242,10 +290,10 @@ def write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
         f.write(text)
 
 
-def copy_tree(src: Path, dst: Path) -> None:
+def copy_tree(src: Path, dst: Path, ignore=None) -> None:
     if dst.exists():
         shutil.rmtree(dst)
-    shutil.copytree(src, dst)
+    shutil.copytree(src, dst, ignore=ignore)
     log(f"copy  {src.name}/ -> {dst.relative_to(DIST)}/")
 
 
@@ -258,22 +306,28 @@ def check_runtime() -> None:
         "import cv2, numpy, onnxruntime, rapidocr_onnxruntime, "
         "pymobiledevice3, cryptography; print('ok')"
     )
-    result = subprocess.run(
-        [str(PYTHON), "-c", code],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=45,
-    )
+    log("check  正在加载 OCR / iOS 依赖（首次可能较慢）…")
+    try:
+        result = subprocess.run(
+            [str(PYTHON), "-c", code],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        fail("内置 Python 运行库加载超过 180 秒，请检查磁盘占用或杀毒软件拦截。")
     if result.returncode != 0 or "ok" not in result.stdout:
         fail("内置 Python 缺少运行库：\n" + (result.stderr or result.stdout)[-1600:])
     log("check  Python / OCR / iOS 依赖 OK")
 
 
 def copy_sources() -> None:
-    for name in ("qishui_gui.py", "qishui_auto.py", "ios_core.py", "launcher.py",
-                 "requirements.txt", "LICENSE", "CHANGELOG.md"):
+    for name in ("qishui_gui.py", "qishui_auto.py", "ios_core.py",
+                 "ios_wda.py", "wda_runner.py", "launcher.py",
+                 "requirements.txt", "LICENSE", "CHANGELOG.md",
+                 "THIRD_PARTY_NOTICES.md"):
         src = SRC / name
         if not src.exists():
             fail(f"缺少源码：{name}")
@@ -285,7 +339,7 @@ def copy_assets() -> None:
     src = SRC / "assets"
     if not src.is_dir() or not (src / "avatar.webp").exists():
         fail("缺少 assets/avatar.webp")
-    copy_tree(src, DIST / "assets")
+    copy_tree(src, DIST / "assets", ignore=shutil.ignore_patterns("ios-signing-guide.webp"))
 
 
 def _support_manifest_body(files: dict[str, str], version: int) -> bytes:
@@ -422,6 +476,7 @@ def prepare_config_and_docs() -> None:
     write_text(DIST / "环境自检.bat", BAT_CHECK)
     write_text(DIST / "使用说明.txt", README, encoding="utf-8-sig")
     log("make  one-click launchers / docs / default profile")
+    write_text(DIST / "连接向导.bat", SETUP_BAT)
 
 
 def package_versions() -> None:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""iPhone USB backend for iOS 17+.
+"""iPhone USB backend for iOS 27+.
 
 The backend keeps one userspace RemoteServiceDiscovery tunnel and one set of
 CoreDevice services alive in a dedicated asyncio thread.  Screen captures,
@@ -9,6 +9,9 @@ action.
 Basic device information is read through lockdownd over usbmux and works before
 Developer Mode is enabled.  Screen capture and touch need Developer Mode and a
 mounted Developer Disk Image; the first preparation is handled automatically.
+
+Apple only allows the CoreDevice media stream that authenticates HID input from
+iOS 27.0. iOS 17.0-26.x must use WebDriverAgent for touch automation.
 """
 from __future__ import annotations
 
@@ -299,6 +302,28 @@ class _IOSCore:
             raise IOSCoreError("未检测到通过 USB 连接的 iPhone，请检查数据线", "not_connected")
         target = _plain(probe.get("udid"))
         self._udid = target
+        version = _plain(probe.get("ios"))
+        try:
+            version_parts = [int(part) for part in version.split(".")[:2]]
+        except (TypeError, ValueError):
+            version_parts = []
+        major = version_parts[0] if version_parts else 0
+        minor = version_parts[1] if len(version_parts) > 1 else 0
+
+        if major and major < 17:
+            raise IOSCoreError(
+                "iOS 16 及以下需要使用 WebDriverAgent（WDA）兼容通道。"
+                "请先安装并启动 WDA，再在「旧版 WDA」中填写本机地址。",
+                "legacy_wda_required",
+            )
+        if major and major < 27:
+            raise IOSCoreError(
+                f"这台 iPhone 运行 iOS {version}；Apple 从 iOS 27.0 才开始开放"
+                "免签触控通道。请先升级 iPhone 系统；如果必须保留当前版本，"
+                "请安装并启动 WebDriverAgent，再在「WDA 地址」中填写 "
+                "http://127.0.0.1:8100。",
+                "ios27_required",
+            )
 
         if probe.get("developer_mode") is False:
             await asyncio.to_thread(self._reveal_developer_mode, target)
@@ -318,8 +343,22 @@ class _IOSCore:
 
         stack = contextlib.AsyncExitStack()
         try:
-            tunnel = UserspaceRsdTunnel(serial=target)
-            rsd = await tunnel.aopen()
+            tunnel = UserspaceRsdTunnel(
+                serial=target,
+                autopair=True,
+                remotepairing_fallback=True,
+            )
+            try:
+                rsd = await tunnel.aopen()
+            except Exception as exc:
+                if major == 17 and minor < 4:
+                    raise IOSCoreError(
+                        "iOS 17.0–17.3 需要先完成远程配对。请保持 iPhone 与电脑在同一网络、"
+                        "解锁并信任电脑后重试；如果仍失败，请升级到 iOS 17.4+，"
+                        "或在「旧版 WDA」中填写 WebDriverAgent 地址。",
+                        "remotepairing",
+                    ) from exc
+                raise
             stack.push_async_callback(tunnel.aclose)
 
             device_info_svc = DeviceInfoService(rsd)

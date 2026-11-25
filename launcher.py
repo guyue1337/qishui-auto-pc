@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 
 
@@ -23,6 +25,9 @@ APP = BASE / "qishui_gui.py"
 PROFILE = BASE / "device_profile.json"
 APPLE_SERVICE = "Apple Mobile Device Service"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+STATE_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "QishuiMusicAutomation"
+FIRST_RUN_MARKER = STATE_DIR / "first_run_v1.json"
+DEFAULT_APP_VERSION = "1.4.0"
 
 DEFAULT_PROFILE = {
     "platform": "android",
@@ -121,10 +126,153 @@ def _ensure_profile() -> None:
 
 def _check_files() -> list[str]:
     missing = []
-    for path in (PYTHON, ADB, APP, BASE / "qishui_auto.py", BASE / "ios_core.py"):
+    for path in (
+        PYTHON,
+        ADB,
+        APP,
+        BASE / "qishui_auto.py",
+        BASE / "ios_core.py",
+        BASE / "ios_wda.py",
+        BASE / "wda_runner.py",
+    ):
         if not path.exists():
             missing.append(str(path.relative_to(BASE)))
     return missing
+
+
+def _first_run_needed() -> bool:
+    return not FIRST_RUN_MARKER.exists()
+
+
+def _app_version() -> str:
+    try:
+        data = json.loads((BASE / "version.json").read_text(encoding="utf-8"))
+        version = str(data.get("version") or "").strip()
+        if version:
+            return version
+    except (OSError, ValueError, TypeError):
+        pass
+    return DEFAULT_APP_VERSION
+
+
+def _mark_first_run_done() -> None:
+    try:
+        FIRST_RUN_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "completed_at": datetime.now().isoformat(timespec="seconds"),
+            "version": _app_version(),
+        }
+        FIRST_RUN_MARKER.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _windows_status() -> tuple[bool, str]:
+    if os.name != "nt":
+        return False, f"{platform.system()} {platform.release()}"
+    version = sys.getwindowsversion()
+    label = "Windows 11" if version.build >= 22000 else f"Windows {version.major}.{version.minor}"
+    arch = "64 位" if sys.maxsize > 2**32 else "32 位"
+    return version.major >= 10 and sys.maxsize > 2**32, f"{label}（{arch}）"
+
+
+def _show_android_setup() -> None:
+    print("""
+┌─ 安卓手机连接步骤 ──────────────────────────────┐
+│ 1. 设置 → 关于手机 → 连续点击「版本号」7 次     │
+│ 2. 设置 → 系统/更多设置 → 开发者选项            │
+│ 3. 打开「USB 调试」，部分品牌还要开「USB 安装」 │
+│ 4. 用数据线连接电脑，USB 用途选择「传输文件」   │
+│ 5. 手机弹出「允许 USB 调试」时点允许            │
+│ 6. 回到控制台，选择 Android → 读取 Android 手机 │
+└────────────────────────────────────────────────┘
+如果电脑设备管理器出现黄色感叹号：
+  · 荣耀 / 华为：安装官方 HiSuite
+  · 小米 / Redmi：安装小米手机助手
+  · OPPO / 一加 / realme、vivo / iQOO：安装对应官方助手
+  · Google / Pixel：使用 drivers\\Android\\google_usb
+""")
+
+
+def _show_iphone_setup() -> None:
+    status = _apple_service_status().upper()
+    if status == "STOPPED":
+        print("[驱动] Apple Mobile Device Service 已安装但未运行，正在尝试启动...")
+        if _try_start_apple_service():
+            print("[驱动] Apple 服务已启动。")
+        else:
+            print("[驱动] 启动失败，请右键以管理员身份运行 drivers\\iPhone\\安装iPhone驱动.bat。")
+    elif status != "RUNNING":
+        print("[驱动] 未检测到 Apple Mobile Device Service，iPhone 将无法被电脑识别。")
+        print("       可以现在安装 Apple 官方驱动组件，也可以稍后运行")
+        print("       drivers\\iPhone\\安装iPhone驱动.bat")
+        try:
+            choice = input("        现在安装？[1 安装 / 2 稍后，默认 2]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "2"
+        if choice == "1":
+            _install_apple_driver()
+            _pause("安装流程结束，按回车继续...")
+
+    print("""
+┌─ iPhone 连接步骤 ──────────────────────────────┐
+│ 1. 安装 Apple 官方设备驱动（iTunes / Apple Devices）│
+│ 2. 用 USB 数据线连接电脑                         │
+│ 3. 手机解锁后点「信任此电脑」，输入锁屏密码       │
+│ 4. 设置 → 隐私与安全性 → 开发者模式 → 打开       │
+│ 5. 重启 iPhone，再回到控制台选择 iPhone          │
+└────────────────────────────────────────────────┘
+兼容范围：
+  · iOS 27.0 及以上：USB 免签直连，不需要证书
+  · iOS 17.0–26.x：控制台内按向导一键安装并启动 WDA
+  · iOS 16 及以下：暂不支持，建议先升级系统
+免费 Apple ID 的 WDA 签名通常约 7 天，到期后在控制台内续签。
+首次准备 iPhone 组件需要联网，可能等待几分钟。
+""")
+
+
+def _first_run_wizard(imports_ok: bool, devices: list[dict[str, str]]) -> None:
+    windows_ok, windows_label = _windows_status()
+    apple_status = _apple_service_status().upper()
+    apple_label = {
+        "RUNNING": "已运行",
+        "STOPPED": "已安装但未运行",
+        "MISSING": "未安装（只影响 iPhone）",
+    }.get(apple_status, apple_status)
+
+    print("\n" + "=" * 62)
+    print(" 首次使用 · 环境与驱动检查")
+    print("=" * 62)
+    print(f"  [{'OK' if windows_ok else '提示'}] 系统        {windows_label}")
+    print(f"  [{'OK' if imports_ok else '异常'}] 运行库      {'完整' if imports_ok else '缺失或损坏'}")
+    print(f"  [{'OK' if ADB.exists() else '异常'}] ADB         {'已内置' if ADB.exists() else '缺失'}")
+    print(f"  [{'OK' if apple_status == 'RUNNING' else '提示'}] iPhone 驱动  {apple_label}")
+    if devices:
+        states = "，".join(f"{d['serial']} [{d['state']}]" for d in devices)
+        print(f"  [OK] 安卓设备  {states}")
+    elif _apple_device_present():
+        print("  [OK] iPhone    已检测到 USB 连接")
+    else:
+        print("  [提示] 手机      暂未检测到，可先查看连接步骤")
+    print("=" * 62)
+    print(" 提示：Android 需要 USB 调试；iPhone 需要信任电脑和开发者模式。")
+    try:
+        choice = input(" 先看哪种手机的连接步骤？[1 安卓 / 2 iPhone / 3 两种 / 回车跳过]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        choice = ""
+    if choice == "1":
+        _show_android_setup()
+    elif choice == "2":
+        _show_iphone_setup()
+    elif choice == "3":
+        _show_android_setup()
+        _show_iphone_setup()
+    else:
+        print("已跳过首次向导。以后可双击「连接向导.bat」重新查看。")
+    print("=" * 62)
 
 
 def _check_imports() -> tuple[bool, str]:
@@ -132,8 +280,11 @@ def _check_imports() -> tuple[bool, str]:
         "import cv2, numpy, onnxruntime, rapidocr_onnxruntime, "
         "pymobiledevice3, cryptography; print('ok')"
     )
+    print(" 正在加载 OCR 与 iPhone 组件，首次启动可能需要 1–2 分钟，请稍候…", flush=True)
     try:
-        result = _run([str(PYTHON), "-c", code], timeout=45.0)
+        result = _run([str(PYTHON), "-c", code], timeout=180.0)
+    except subprocess.TimeoutExpired:
+        return False, "组件加载超过 180 秒。请关闭杀毒软件拦截后重试，或重新解压完整便携包。"
     except Exception as exc:
         return False, str(exc)
     if result.returncode == 0 and "ok" in (result.stdout or ""):
@@ -299,6 +450,7 @@ def main() -> int:
     _configure_console()
     parser = argparse.ArgumentParser(description="汽水音乐自动化便携版启动器")
     parser.add_argument("--check", action="store_true", help="只做环境自检，不启动控制台")
+    parser.add_argument("--setup", action="store_true", help="打开首次使用环境与连接向导")
     parser.add_argument("--install-iphone-driver", action="store_true", help="安装 Apple 官方 iPhone 驱动组件")
     parser.add_argument("--android-driver-help", action="store_true", help="显示安卓 USB 驱动说明")
     args = parser.parse_args()
@@ -337,6 +489,17 @@ def main() -> int:
     if args.check:
         print("环境自检完成，可以启动。")
         return 0
+
+    if args.setup:
+        _first_run_wizard(imports_ok, devices)
+        _mark_first_run_done()
+        _pause("按回车关闭窗口...")
+        return 0
+
+    if _first_run_needed():
+        _first_run_wizard(imports_ok, devices)
+        _mark_first_run_done()
+        _pause("按回车继续启动控制台...")
 
     _maybe_setup_apple_driver()
 

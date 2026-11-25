@@ -35,14 +35,16 @@ except Exception:
 # ================== 配置区 ==================
 # 领奖目标（按优先级，先点靠前的）
 REWARD_TARGETS = ["领取奖励", "继续观看"]
-# 关闭类目标：广告结束页右上角的「领取成功 ×」胶囊，点它才会关掉广告、弹出奖励弹窗
-CLOSE_TARGETS = ["领取成功", "退出不看了"]
+# 关闭类目标：先退出会挡住流程的互动弹窗，再关闭广告结束页右上角的「领取成功」胶囊
+CLOSE_TARGETS = ["坚持退出", "退出不看了", "领取成功"]
 # 「xx秒后 / xx s 后进入直播间 [取消]」：文字需同时含倒计时和「进入直播间」，
 # 避免把普通横幅「点击进入直播间」也当成自动跳转
 
 # 跳过目标（仅当广告本身允许跳过时才会出现）
 SKIP_TARGETS = ["跳过广告", "跳过", "关闭广告"]
 ENABLE_SKIP = True          # 提前点“跳过”有可能拿不到奖励，视情况关掉
+AD_FAST_MODE = True         # 广告极速：优先识别跳过，播放期间只扫必要区域
+AD_FAST_FALLBACK_EVERY = 4  # 极速模式下每几轮补扫一次底部/免费听区域，防止卡住
 
 USE_UIAUTOMATOR = False     # True / False / "auto"。默认关：它看不到弹窗等覆盖层，会抢占 OCR
 OCR_SCORE = 0.5             # OCR 置信度下限
@@ -62,6 +64,7 @@ TARGET_ROI = {
     "领取奖励": {"x": (0.20, 0.80), "y": (0.30, 0.78)},
     "继续观看": {"x": (0.20, 0.80), "y": (0.30, 0.78)},
     "领取成功": {"x": (0.55, 1.00), "y": (0.00, 0.20)},
+    "坚持退出": {"x": (0.18, 0.82), "y": (0.42, 0.82)},
     "退出不看了": {"x": (0.00, 1.00), "y": (0.80, 1.00)},
     "跳过广告": {"x": (0.55, 1.00), "y": (0.00, 0.20)},
     "跳过":     {"x": (0.55, 1.00), "y": (0.00, 0.20)},
@@ -532,7 +535,7 @@ def ios_core_ready():
 
 
 def ios_prepare(serial=None):
-    """准备 iOS 17+ 的免签 USB 直连；返回 (ok, error, code)。"""
+    """准备 iOS 27+ 的免签 USB 直连；低版本回退 WDA。返回 (ok, error, code)。"""
     global IOS_CORE_LAST_ERROR, IOS_LAST_ERROR, screen_cache
     try:
         core = _ios_core_backend()
@@ -792,6 +795,7 @@ def get_ios_device_info(force=False):
         "wda": IOS_WDA_URL,
         "bundle": IOS_BUNDLE_ID,
         "developer_mode": None,
+        "needs_wda": False,
         "error": "",
         "hint": "",
     }
@@ -806,11 +810,15 @@ def get_ios_device_info(force=False):
 
     version = str(core_probe.get("ios") or "")
     try:
-        major = int(version.split(".", 1)[0])
+        version_parts = [int(part) for part in version.split(".")[:2]]
     except Exception:
-        major = 0
+        version_parts = []
+    major = version_parts[0] if version_parts else 0
+    minor = version_parts[1] if len(version_parts) > 1 else 0
     core_ready = bool(core is not None and core.is_ready)
-    if core_probe and (major >= 17 or core_ready or not _ios_wda_available(force=False)):
+    wda_ready = _ios_wda_available(force=False)
+    prefer_wda = bool(0 < major < 27 and wda_ready)
+    if core_probe and not prefer_wda and (major >= 17 or core_ready or not wda_ready):
         model = str(core_probe.get("model") or "")
         physical_w, physical_h, scale = _IOS_MODEL_SCREENS.get(model, (0, 0, 0))
         dw, dh = core.display_size
@@ -839,13 +847,29 @@ def get_ios_device_info(force=False):
         info["connected"] = True
         info["ready"] = core_ready
         info["state"] = "device" if core_ready else "usb"
-        info["driver"] = "CoreDevice USB" if core_ready else "USB"
+        if core_ready:
+            info["driver"] = "CoreDevice USB"
+        elif 0 < major < 27:
+            info["driver"] = "USB · 需 WDA"
+            info["needs_wda"] = True
+        else:
+            info["driver"] = "USB"
         if core_ready and info["width"] and info["height"]:
             screen_cache = (int(info["width"]), int(info["height"]))
         if core_probe.get("developer_mode") is False:
             info["error"] = "iPhone 已连接；请开启「开发者模式」后重启手机"
             info["hint"] = ("设置 → 隐私与安全性 → 开发者模式。开启并重启后，"
                             "无需安装证书即可直接控制 iPhone。")
+        elif major and major < 17:
+            info["error"] = "iOS 16 及以下未纳入当前兼容范围"
+            info["hint"] = "当前版本支持 iOS 17.0 及以上，请先升级 iPhone 系统。"
+        elif 0 < major < 27 and not core_ready:
+            info["error"] = f"iOS {version} 不支持免签自动点击"
+            info["hint"] = (
+                "Apple 从 iOS 27.0 才开放免签触控通道。"
+                "请点开控制台右侧「旧版 iPhone 兼容通道」，"
+                "按向导自动安装并启动 WDA。"
+            )
         elif not core_ready:
             info["hint"] = "USB 已连接。点「开始」时会自动准备免签直连，首次可能需要几分钟。"
         _ios_device_cache.update(v=info, ts=now)
@@ -864,7 +888,7 @@ def get_ios_device_info(force=False):
             info["name"] = _ios_marketing_name(info["model"], core_probe.get("name"))
             info["device_name"] = str(core_probe.get("name") or "")
             info["error"] = "当前 iPhone 系统版本需要使用旧版 WDA 兼容模式"
-            info["hint"] = "在旧版 iOS 兼容项中配置 WebDriverAgent 后可直接使用。"
+            info["hint"] = "点开右侧「旧版 iPhone 兼容通道」，按向导一键配置 WDA。"
         else:
             info["error"] = ("未检测到 iPhone。请用 USB 数据线连接，解锁手机并点「信任此电脑」。"
                              + ((" " + IOS_CORE_LAST_ERROR) if IOS_CORE_LAST_ERROR else ""))
@@ -1476,7 +1500,7 @@ def try_cancel_live_enter(nodes, source):
     return False
 
 
-def match_and_click(nodes, source, screen=None):
+def match_and_click(nodes, source, screen=None, targets=None):
     """在节点里找目标并点击。命中返回目标字符串，否则 None"""
     if not nodes:
         return None
@@ -1485,7 +1509,8 @@ def match_and_click(nodes, source, screen=None):
         return "取消"
     sw, sh = screen_size()
     # 领奖优先，其次“领取成功 / 退出不看了”（关广告），最后才跳过
-    targets = REWARD_TARGETS + CLOSE_TARGETS + (SKIP_TARGETS if ENABLE_SKIP else [])
+    if targets is None:
+        targets = REWARD_TARGETS + CLOSE_TARGETS + (SKIP_TARGETS if ENABLE_SKIP else [])
 
     for target in targets:
         cands = []
@@ -1527,16 +1552,39 @@ def _merge_ocr_nodes(*groups):
     return merged
 
 
-def fast_scan_and_click(screen, source="ocr"):
+def fast_scan_and_click(screen, source="ocr", idle=0):
     """只扫描按钮附近区域并尝试点击，返回 (命中目标, 本轮OCR节点)。"""
     global LAST_FREE_DAYS
     if screen is None:
         return None, []
 
+    # 极速模式：先取得顶部与中央两块结果，再按“领奖 > 关闭 > 跳过”决策。
+    # 广告播放期间不扫描免费听/底部区域，每轮 OCR 从 5 次降到 2 次。
     top_nodes = _ocr_region(screen, FAST_TOP_ROI)
-    hit = match_and_click(top_nodes, source, screen)
+    reward_nodes = _ocr_region(screen, FAST_REWARD_ROI)
+
+    # 奖励弹窗的「领取奖励」优先级高于广告结束页右上角的「领取成功 ×」。
+    # 后者只是一条关闭胶囊，先点它会反复关掉顶部提示，中央弹窗永远不动。
+    hit = match_and_click(reward_nodes, source, screen, targets=REWARD_TARGETS)
     if hit:
-        return hit, top_nodes
+        return hit, _merge_ocr_nodes(top_nodes, reward_nodes)
+
+    hit = match_and_click(top_nodes, source, screen, targets=CLOSE_TARGETS)
+    if hit:
+        return hit, _merge_ocr_nodes(top_nodes, reward_nodes)
+
+    if ENABLE_SKIP:
+        hit = match_and_click(top_nodes, source, screen, targets=SKIP_TARGETS)
+        if hit:
+            return hit, _merge_ocr_nodes(top_nodes, reward_nodes)
+
+    # 极速模式下按间隔补扫边缘按钮；非极速模式保持原来的完整扫描。
+    scan_edges = (not AD_FAST_MODE) or (
+        idle >= AD_FAST_FALLBACK_EVERY
+        and idle % AD_FAST_FALLBACK_EVERY == 0
+    )
+    if not scan_edges:
+        return None, _merge_ocr_nodes(top_nodes, reward_nodes)
 
     free_nodes = _ocr_region(screen, FREE_LISTEN_ROI)
     days = _parse_free_days_nodes(free_nodes)
@@ -1547,7 +1595,6 @@ def fast_scan_and_click(screen, source="ocr"):
             do_click(node[1], node[2], "免费听", node[0], source, screen)
             return "免费听", _merge_ocr_nodes(top_nodes, free_nodes)
 
-    reward_nodes = _ocr_region(screen, FAST_REWARD_ROI)
     combined = _merge_ocr_nodes(top_nodes, reward_nodes)
     hit = match_and_click(combined, source, screen)
     if hit:
@@ -1950,6 +1997,7 @@ def main():
           f"uiautomator: {'开' if use_uia else '关'}")
     print(f"   领奖目标: {REWARD_TARGETS}")
     print(f"   跳过目标: {SKIP_TARGETS if ENABLE_SKIP else '已禁用'}")
+    print(f"   广告极速: {'开' if AD_FAST_MODE else '关'}")
     print("   停止请按 Ctrl + C")
     print("-" * 50)
 
@@ -1982,8 +2030,10 @@ def main():
             # 主通道：OCR。奖励弹窗等覆盖层 uiautomator 抓不到，必须靠 OCR
             if use_ocr:
                 screen = screenshot()
-                if screen is not None and match_and_click(ocr_nodes(screen), "ocr", screen):
-                    clicked = True
+                if screen is not None:
+                    target, _nodes = fast_scan_and_click(screen, "ocr", idle=idle)
+                    if target:
+                        clicked = True
 
             # 兜底：OCR 没找到时才用 uiautomator
             if not clicked and use_uia:

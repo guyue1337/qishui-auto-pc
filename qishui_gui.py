@@ -9,6 +9,7 @@
 只用标准库 + 已装好的 cv2/numpy，不引入任何新依赖。
 """
 import base64
+import atexit
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ except Exception:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 import qishui_auto as q  # noqa: E402
+import ios_wda  # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -76,6 +78,7 @@ class State:
         self.device_ts = 0.0
         self.vip = {"start_days": 0, "per": 3, "cap": 30, "total": 0, "real_days": -1}
         self.real_ts = 0.0
+        self.wda_prompt = False
 
     def log(self, text, level="info"):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -90,6 +93,9 @@ class State:
 
 
 S = State()
+WDA = ios_wda.get_manager()
+WDA.set_log_sink(lambda text, level="info": S.log(text, level))
+atexit.register(WDA.shutdown)
 
 
 def load_vip():
@@ -419,6 +425,8 @@ def apply_device_info(info):
         "hint": info.get("hint") or "",
         "wda": info.get("wda") or q.IOS_WDA_URL,
         "bundle": info.get("bundle") or q.IOS_BUNDLE_ID,
+        "needs_wda": bool(info.get("needs_wda")),
+        "wda_version": info.get("wda_version") or "",
         "error": info.get("error") or "",
     }
     S.device_ts = time.time()
@@ -518,19 +526,39 @@ def worker():
             q.OCR_MAX_WIDTH = int(q.PROFILE["ocr_width"])
     except Exception:
         pass
-    if q.PLATFORM == "ios" and not q.ios_available():
-        S.log("iPhone USB 已连接，正在准备免签直连（首次可能需要几分钟）…", "info")
-        ok, err, code = q.ios_prepare()
-        if not ok and not q.ios_available():
-            if code == "developer_mode":
-                S.log("请在 iPhone 打开「设置 → 隐私与安全性 → 开发者模式」，开启并重启后再点开始", "error")
-            else:
-                S.log(err or "iPhone 直连准备失败", "error")
-            S.running = False
-            return
-        q.screen_cache = None
-        q._ios_device_cache.update(v=None, ts=0.0)
-        S.log("iPhone 免签直连已就绪", "ok")
+    if q.PLATFORM == "ios":
+        info = q.get_ios_device_info(force=True)
+        apply_device_info(info)
+        try:
+            major = int(str(S.device.get("ios") or "").split(".", 1)[0])
+        except Exception:
+            major = 0
+        if (0 < major < 27) or S.device.get("needs_wda"):
+            if not q.ios_available():
+                S.log("iOS 17–26.x 需要 WebDriverAgent，正在准备兼容通道…", "info")
+                ok, err = WDA.ensure_running(dict(S.device or {}))
+                if not ok:
+                    S.wda_prompt = True
+                    S.log(err or "WDA 启动失败", "error")
+                    S.running = False
+                    return
+                q.configure_platform("ios", ios_wda.WDA_URL, q.IOS_BUNDLE_ID)
+                q.screen_cache = None
+                q._ios_device_cache.update(v=None, ts=0.0)
+            S.log("旧版 iPhone 兼容通道已就绪", "ok")
+        elif not q.ios_available():
+            S.log("iPhone USB 已连接，正在准备免签直连（首次可能需要几分钟）…", "info")
+            ok, err, code = q.ios_prepare()
+            if not ok and not q.ios_available():
+                if code == "developer_mode":
+                    S.log("请在 iPhone 打开「设置 → 隐私与安全性 → 开发者模式」，开启并重启后再点开始", "error")
+                else:
+                    S.log(err or "iPhone 直连准备失败", "error")
+                S.running = False
+                return
+            q.screen_cache = None
+            q._ios_device_cache.update(v=None, ts=0.0)
+            S.log("iPhone 免签直连已就绪", "ok")
     if not detect_device():
         if q.PLATFORM == "ios":
             S.log(S.device.get("error") or "未检测到 iPhone，请检查 USB、解锁并信任电脑", "error")
@@ -632,7 +660,7 @@ def worker():
                 S.frame = encode_frame(screen)
                 S.frame_ts = time.time()
                 try:
-                    target, nodes = q.fast_scan_and_click(screen, "ocr")
+                    target, nodes = q.fast_scan_and_click(screen, "ocr", idle=idle)
                     try:
                         n_day = q.parse_free_days(nodes)
                         if n_day is None:
@@ -671,19 +699,34 @@ def worker():
 
 def start_run():
     if S.running:
-        return
+        return {"started": False, "running": True}
     if not S.device.get("connected") and not detect_device():
         if q.PLATFORM == "ios":
             S.log(S.device.get("error") or "未检测到 iPhone，请检查 USB 连接并信任电脑", "error")
         else:
             S.log("未检测到设备：请检查 USB 连接与「USB 调试」授权", "error")
-        return
+        return {"started": False, "running": False}
+    if q.PLATFORM == "ios" and S.device.get("needs_wda") and not q.ios_available():
+        status = WDA.status(device=dict(S.device or {}), deep=True)
+        if not status.get("installed") or status.get("needs_resign"):
+            S.wda_prompt = True
+            message = ("WDA 签名已过期，请重新安装/续签" if status.get("needs_resign")
+                       else "iOS 17–26.x 需要先安装 WDA")
+            S.log(message, "warn")
+            return {
+                "started": False,
+                "running": False,
+                "needs_wda_setup": True,
+                "wda": status,
+            }
+    S.wda_prompt = False
     S.clicks = 0
     S.rounds = 0
     S.running = True
     S.stop_flag.clear()
     S.log("开始运行", "ok")
     threading.Thread(target=worker, daemon=True).start()
+    return {"started": True, "running": True}
 
 
 def _safe_unmute():
@@ -1112,6 +1155,84 @@ body::before,body::after{display:none}
 .chip{background:var(--ios-fill);border:0;box-shadow:none;color:#3a3a3c;
   border-radius:12px;padding:8px 10px}
 .qq{color:var(--ios-gray)}
+
+/* ================= 旧版 iPhone WDA ================= */
+.wda-card{display:none;margin-top:9px;padding:11px 12px;border-radius:16px;
+  background:linear-gradient(145deg,rgba(0,122,255,.09),rgba(255,255,255,.42));
+  border:1px solid rgba(0,122,255,.14)}
+.wda-card.show{display:block}
+.wda-card-head{display:flex;align-items:center;gap:9px}
+.wda-apple{width:31px;height:31px;flex:0 0 31px;border-radius:10px;display:grid;
+  place-items:center;background:linear-gradient(160deg,#4b4b50,#1c1c1e);color:#fff;
+  box-shadow:0 5px 12px rgba(20,20,25,.18)}
+.wda-apple svg{width:17px;height:17px}
+.wda-card-title{min-width:0;flex:1;display:flex;flex-direction:column;line-height:1.25}
+.wda-card-title b{font-size:12.5px;color:#1c1c1e}
+.wda-card-title small{margin-top:2px;font-size:10px;color:var(--ios-gray);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wda-chip{flex:0 0 auto;padding:4px 8px;border-radius:999px;background:rgba(118,118,128,.13);
+  color:#6e6e73;font-size:9.5px;font-weight:700}
+.wda-chip.ok{background:rgba(52,199,89,.15);color:#248a3d}
+.wda-chip.warn{background:rgba(255,149,0,.15);color:#a56400}
+.wda-chip.err{background:rgba(255,59,48,.13);color:#c0271f}
+.wda-card-copy{margin:8px 0 0;font-size:10.5px;line-height:1.55;color:#5b6484}
+.wda-card-btn{width:100%;margin-top:8px;height:32px;border:0;border-radius:10px;
+  background:linear-gradient(180deg,#339dff,#007aff);color:#fff;font:inherit;
+  font-size:11.5px;font-weight:700;cursor:pointer;box-shadow:0 5px 13px rgba(0,122,255,.20)}
+.wda-card-btn:active{transform:scale(.985)}
+.wda-card.coredevice{background:linear-gradient(145deg,rgba(52,199,89,.10),rgba(255,255,255,.44));
+  border-color:rgba(52,199,89,.16)}
+.wda-card.coredevice .wda-card-btn{display:none}
+.wda-sheet{width:min(620px,100%)}
+.wda-hero{display:flex;align-items:flex-start;gap:13px;padding:1px 28px 0 0}
+.wda-hero .wda-apple{width:45px;height:45px;flex-basis:45px;border-radius:14px}
+.wda-hero .wda-apple svg{width:24px;height:24px}
+.wda-hero h3{margin:0;font-size:20px;letter-spacing:-.3px;color:#1c1c1e}
+.wda-hero p{margin:5px 0 0;font-size:11.5px;line-height:1.65;color:#6e6e73}
+.wda-warning{display:flex;gap:8px;margin-top:13px;padding:10px 11px;border-radius:12px;
+  background:rgba(255,149,0,.11);border:1px solid rgba(255,149,0,.16);
+  color:#7a4a12;font-size:10.8px;line-height:1.6}
+.wda-warning b{font-weight:700}
+.wda-steps{margin:12px 0 0;padding:0;list-style:none;display:grid;
+  grid-template-columns:repeat(3,1fr);gap:7px;counter-reset:wda}
+.wda-steps li{position:relative;padding:9px 9px 9px 28px;border-radius:11px;
+  background:rgba(118,118,128,.08);font-size:10px;line-height:1.45;color:#3a3a3c;
+  counter-increment:wda}
+.wda-steps li::before{content:counter(wda);position:absolute;left:8px;top:9px;
+  width:14px;height:14px;border-radius:50%;display:grid;place-items:center;
+  background:rgba(0,122,255,.14);color:#0068d7;font-size:8px;font-weight:800}
+.wda-status{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:12px}
+.wda-status .item{padding:8px 10px;border-radius:11px;background:var(--ios-fill)}
+.wda-status .k{font-size:9.5px;color:var(--ios-gray)}
+.wda-status .v{margin-top:2px;font-size:11px;font-weight:600;color:#1c1c1e;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wda-progress{height:5px;margin-top:12px;border-radius:99px;background:rgba(118,118,128,.14);
+  overflow:hidden;display:none}
+.wda-progress.show{display:block}
+.wda-progress i{display:block;height:100%;width:0;border-radius:99px;
+  background:linear-gradient(90deg,#0a84ff,#5e5ce6);transition:width .3s}
+.wda-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.wda-actions .btn{height:39px;font-size:12px;border-radius:11px}
+.wda-actions .primary{grid-column:1/-1}
+.wda-log{height:132px;margin-top:11px;padding:9px 11px;overflow:auto;border-radius:12px;
+  background:rgba(0,0,0,.045);border:1px solid rgba(118,118,128,.08);
+  font:10px/1.7 ui-monospace,"SF Mono",Consolas,monospace;color:#4a5068}
+.wda-log .dim{color:#8e8e93}.wda-log .ok{color:#248a3d}.wda-log .error{color:#c0271f}
+.wda-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px}
+.wda-foot small{font-size:9.5px;line-height:1.5;color:var(--ios-gray)}
+.wda-logout{border:0;background:transparent;color:#8e8e93;font-size:10px;
+  text-decoration:underline;cursor:pointer;padding:2px}
+body.dark .wda-card{background:linear-gradient(145deg,rgba(10,132,255,.13),rgba(44,44,46,.60));
+  border-color:rgba(10,132,255,.20)}
+body.dark .wda-card.coredevice{background:linear-gradient(145deg,rgba(52,199,89,.13),rgba(44,44,46,.60));
+  border-color:rgba(52,199,89,.20)}
+body.dark .wda-card-title b,body.dark .wda-hero h3,body.dark .wda-status .v{color:#f2f2f7}
+body.dark .wda-card-copy,body.dark .wda-hero p,body.dark .wda-foot small{color:#aeaeb2}
+body.dark .wda-warning{background:rgba(255,159,10,.14);border-color:rgba(255,159,10,.20);color:#ffc46b}
+body.dark .wda-steps li{background:rgba(118,118,128,.16);color:#d1d1d6}
+body.dark .wda-steps li::before{background:rgba(10,132,255,.20);color:#8ec5ff}
+body.dark .wda-status .item{background:#2c2c2e}
+body.dark .wda-log{background:rgba(0,0,0,.22);border-color:rgba(255,255,255,.06);color:#c7c7cc}
 
 /* ================= 支持弹窗 ================= */
 .modal{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;
@@ -1653,7 +1774,7 @@ body.dark .donate-github{color:#f1e2cc;border-color:rgba(255,255,255,.13);
         <span class="plat-ico"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/>
         </svg></span>
-        <span class="plat-txt"><b>iPhone</b><small>USB · 免签直连</small></span>
+        <span class="plat-txt"><b>iPhone</b><small>iOS 17+ · USB</small></span>
       </button>
     </div>
     <button class="themebtn" id="themebtn">切换暗色</button>
@@ -1692,6 +1813,10 @@ body.dark .donate-github{color:#f1e2cc;border-color:rgba(255,255,255,.13);
         <div class="switch">
           <label>允许跳过</label>
           <div class="tog"><input type="checkbox" id="skip"><span></span></div>
+        </div>
+        <div class="switch">
+          <label title="优先识别跳过按钮，减少广告播放期间的无效扫描">广告极速</label>
+          <div class="tog"><input type="checkbox" id="fastad"><span></span></div>
         </div>
       </div>
       <details class="quickhelp" open>
@@ -1736,7 +1861,6 @@ body.dark .donate-github{color:#f1e2cc;border-color:rgba(255,255,255,.13);
       </span>
       <span class="donate-info">
         <span class="donate-row"><em>作者</em><b>guyue1337</b></span>
-        <span class="donate-row"><em>联系方式</em><b>QQ 2021106570</b></span>
       </span>
       <span class="donate-actions">
         <button class="donate-action donate-support" id="supportBtn" type="button"
@@ -1794,7 +1918,7 @@ body.dark .donate-github{color:#f1e2cc;border-color:rgba(255,255,255,.13);
     </div>
     <select id="cfPlatform" class="sr-only" aria-hidden="true">
       <option value="android">Android（ADB）</option>
-      <option value="ios">iPhone（USB 免签直连）</option>
+      <option value="ios">iPhone（iOS 27+ 免签 / 17–26 WDA）</option>
     </select>
     <div class="devmeta" id="devmeta">未读取设备信息</div>
     <div class="cfgbtns config-actions">
@@ -1803,6 +1927,26 @@ body.dark .donate-github{color:#f1e2cc;border-color:rgba(255,255,255,.13);
     </div>
     <div class="cfmsg" id="cfmsg"></div>
     <div class="cfghint" id="cfgHint">Android：插 USB → 点「读取 Android 手机」→「保存参数」。</div>
+
+    <div class="wda-card" id="wdaCard" role="button" tabindex="0"
+      aria-label="打开旧版 iPhone 兼容配置">
+      <div class="wda-card-head">
+        <span class="wda-apple" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/>
+          </svg>
+        </span>
+        <span class="wda-card-title">
+          <b id="wdaCardTitle">检查 iPhone 兼容模式</b>
+          <small id="wdaCardSub">连接并读取 iPhone 后自动判断</small>
+        </span>
+        <span class="wda-chip" id="wdaCardChip">检查中</span>
+      </div>
+      <p class="wda-card-copy" id="wdaCardCopy">
+        iOS 27 及以上免签直连；iOS 17–26 可在这里一键安装并启动 WDA。
+      </p>
+      <button class="wda-card-btn" id="wdaCardBtn" type="button">打开兼容配置</button>
+    </div>
 
     <div class="cfg">
       <div class="cfgrow"><span>机型</span><input id="cfName" placeholder="如 HONOR TFY-AN00"></div>
@@ -1813,7 +1957,7 @@ body.dark .donate-github{color:#f1e2cc;border-color:rgba(255,255,255,.13);
       <div class="cfgrow"><span>OCR宽</span><input id="cfOcr" type="number" min="360" max="1600"></div>
       <div class="cfgrow androidrow"><span>序列号</span><input id="cfSn" placeholder="留空=唯一设备"></div>
       <div class="cfgrow androidrow"><span>ADB</span><input id="cfAdb" placeholder="platform-tools\adb.exe"></div>
-      <div class="cfgrow iosrow"><span>旧版 WDA</span><input id="cfWda" placeholder="仅 iOS 16 及以下需要"></div>
+      <div class="cfgrow iosrow"><span>WDA 地址</span><input id="cfWda" placeholder="自动使用 http://127.0.0.1:8100"></div>
       <div class="cfgrow iosrow"><span>Bundle</span><input id="cfBundle" placeholder="com.soda.music"></div>
     </div>
   </aside>
@@ -1855,12 +1999,76 @@ body.dark .donate-github{color:#f1e2cc;border-color:rgba(255,255,255,.13);
   </div>
 </div>
 
+<div class="modal" id="wdaModal" role="dialog" aria-modal="true" aria-labelledby="wdaTitle">
+  <div class="sheet wda-sheet">
+    <button class="sheet-close" id="wdaClose" type="button" aria-label="关闭">✕</button>
+    <div class="wda-hero">
+      <span class="wda-apple" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="currentColor">
+          <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/>
+        </svg>
+      </span>
+      <div>
+        <h3 id="wdaTitle">旧版 iPhone 兼容配置</h3>
+        <p>适用 iOS 17.0–26.x。向导会自动准备工具、签名安装并启动 WDA。</p>
+      </div>
+    </div>
+
+    <div class="wda-warning">
+      <span>ⓘ</span>
+      <div>免费 Apple ID 签名通常只有 <b>约 7 天有效期</b>，这不是永久免签。
+        到期后回到这里点「安装 / 续签 WDA」即可；iOS 27 及以上无需此步骤。</div>
+    </div>
+
+    <ol class="wda-steps">
+      <li>打开登录入口，在 Impactor 窗口登录 Apple ID</li>
+      <li>回到这里点「安装 / 续签 WDA」并等待完成</li>
+      <li>点「启动 WDA」，看到已就绪后返回开始任务</li>
+    </ol>
+
+    <div class="wda-status">
+      <div class="item"><div class="k">iPhone 系统</div><div class="v" id="wdaVersion">--</div></div>
+      <div class="item"><div class="k">Apple ID</div><div class="v" id="wdaAccount">未登录</div></div>
+      <div class="item"><div class="k">WDA 安装</div><div class="v" id="wdaInstalled">未安装</div></div>
+      <div class="item"><div class="k">WDA 运行</div><div class="v" id="wdaRunning">未启动</div></div>
+      <div class="item"><div class="k">签名剩余</div><div class="v" id="wdaDays">--</div></div>
+      <div class="item"><div class="k">当前步骤</div><div class="v" id="wdaStep">等待检查</div></div>
+    </div>
+
+    <div class="wda-progress" id="wdaProgress"><i id="wdaProgressBar"></i></div>
+
+    <div class="wda-actions">
+      <button class="btn primary" id="wdaInstall" type="button">安装 / 续签 WDA</button>
+      <button class="btn ghost" id="wdaLogin" type="button">打开 Apple ID 登录入口</button>
+      <button class="btn ghost" id="wdaStart" type="button">启动 WDA</button>
+      <button class="btn ghost" id="wdaCheck" type="button">检查状态</button>
+      <button class="btn ghost" id="wdaStop" type="button">停止 WDA</button>
+    </div>
+
+    <div class="wda-log" id="wdaLog"></div>
+    <div class="wda-foot">
+      <small>密码只在 Impactor 窗口输入，本程序不读取、不保存 Apple ID 密码。</small>
+      <button class="wda-logout" id="wdaLogout" type="button">清除本机登录</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let since = 0;
 let currentPlatform = 'android';
 let statusBusy = false;
 let lastRunning = null;
 let manualStopPending = false;
+let wdaStatus = {};
+let wdaFetchBusy = false;
+let wdaFetchTs = 0;
+let wdaRequestBusy = false;
+let wdaLogSince = 0;
+let wdaLogBusy = false;
+let wdaPromptShown = false;
+const wdaCard = document.getElementById('wdaCard');
+const wdaModal = document.getElementById('wdaModal');
+const wdaLog = document.getElementById('wdaLog');
 
 async function j(url, opt){
   let r;
@@ -1890,7 +2098,7 @@ async function refresh(){
       devsub.textContent = s.device.platform === 'ios'
         ? ('iPhone · iOS ' + (s.device.ios || '?')
            + ' · ' + (s.device.driver || (s.device.ready ? 'USB 直连' : 'USB'))
-           + (s.device.ready ? '' : ' · 点开始自动准备'))
+           + (s.device.ready || s.device.needs_wda ? '' : ' · 点开始自动准备'))
         : 'Android ' + (s.device.android || '') + ' · ADB';
     }else if(s.device.state === 'unauthorized'){
       devtxt.textContent = '设备未授权';
@@ -1906,7 +2114,11 @@ async function refresh(){
     devsub.title = s.device.error || '';
     document.getElementById('clicks').textContent = s.clicks;
     document.getElementById('rounds').textContent = s.rounds;
-    document.getElementById('startBtn').disabled = s.running;
+    const startBtn = document.getElementById('startBtn');
+    startBtn.disabled = !!s.running;
+    startBtn.title = s.device.platform === 'ios' && s.device.needs_wda
+      ? '点开始后会自动打开 iOS 17–26 兼容向导'
+      : '';
     document.getElementById('stopBtn').disabled = !s.running;
     document.getElementById('pbadge').textContent = s.running ? '实时' : '预览';
     document.getElementById('pbadge').className = 'badge' + (s.running ? ' live' : '');
@@ -1916,6 +2128,7 @@ async function refresh(){
     document.getElementById('previewCard').classList.toggle('is-live', !!s.running);
     document.getElementById('mute').checked = s.settings.mute;
     document.getElementById('skip').checked = s.settings.skip;
+    document.getElementById('fastad').checked = s.settings.fast_ad;
 
     const v = s.vip;
     if(wasRunning === true && !s.running){
@@ -1943,6 +2156,14 @@ async function refresh(){
       document.getElementById('inPer').value = v.per;
     if(document.activeElement !== document.getElementById('inCap'))
       document.getElementById('inCap').value = v.cap;
+    if(s.wda) renderWdaCard(s.wda);
+    if(s.wda_prompt && !wdaPromptShown){
+      wdaPromptShown = true;
+      openWda();
+    }else if(!s.wda_prompt){
+      wdaPromptShown = false;
+    }
+    if(currentPlatform === 'ios' && Date.now() - wdaFetchTs > 4500) refreshWda();
   }catch(e){}finally{ statusBusy = false; }
 }
 
@@ -1992,7 +2213,15 @@ document.getElementById('startBtn').onclick = async () => {
     manualStopPending = false;
     const d = await j('/api/start', {method:'POST'});
     await refresh();
-    if(d && d.running) openSupport('start');
+    if(d && d.needs_wda_setup){
+      cfgMsg('iOS 17–26 需要先完成 WDA 配置，已打开兼容向导', 'warn');
+      openWda();
+      startWdaPolling();
+    }else if(d && d.running){
+      openSupport('start');
+    }else{
+      cfgMsg('任务未启动：请先连接并读取手机', 'error');
+    }
   }catch(e){
     cfgMsg(e.message || '启动失败', 'error');
   }
@@ -2010,6 +2239,7 @@ document.getElementById('stopBtn').onclick = async () => {
 };
 document.getElementById('mute').onchange = e => j('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mute:e.target.checked})});
 document.getElementById('skip').onchange = e => j('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({skip:e.target.checked})});
+document.getElementById('fastad').onchange = e => j('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({fast_ad:e.target.checked})});
 
 function pushVip(){
   const body = {
@@ -2025,6 +2255,7 @@ refresh(); pullLog(); pullFrame();
 setInterval(refresh, 800);
 setInterval(pullLog, 400);
 setInterval(pullFrame, 900);
+setInterval(pollWda, 1200);
 /* ================= 机型参数 ================= */
 function setPlatformUI(platform){
   currentPlatform = platform === 'ios' ? 'ios' : 'android';
@@ -2038,8 +2269,8 @@ function setPlatformUI(platform){
   const guideSteps = ios ? [
     'USB 连接 iPhone，解锁并信任电脑',
     '开启「设置 → 隐私与安全性 → 开发者模式」',
-    '顶部选 iPhone，点「读取 iPhone」',
-    '点开始，自动打开汽水音乐（免签）'
+    '顶部选 iPhone，点「读取 iPhone」确认型号与系统',
+    'iOS 27+ 直接开始；iOS 17–26 按右侧兼容卡片配置一次 WDA'
   ] : [
     '开启「开发者选项 → USB 调试」',
     'USB 连接电脑，在手机弹窗点「允许调试」',
@@ -2047,7 +2278,7 @@ function setPlatformUI(platform){
     '打开汽水音乐广告页，点「开始」'
   ];
   const guideNote = ios
-    ? 'iOS 17.4+ 免签直连，不需要证书；首次准备可能需要几分钟。'
+    ? 'iOS 27.0+ 免签直连；iOS 17.0–26.x 首次需登录免费 Apple ID 安装 WDA，签名约 7 天后到期续签。'
     : '荣耀等机型若无授权弹窗，请重插数据线，并把 USB 用途切为「传输文件」。';
   document.getElementById('guideSteps').innerHTML = guideSteps.map(s => '<li>' + s + '</li>').join('');
   document.getElementById('guideNote').textContent = guideNote;
@@ -2056,9 +2287,13 @@ function setPlatformUI(platform){
     const bundle = document.getElementById('cfBundle');
     if(!wda.value) wda.value = 'http://127.0.0.1:8100';
     if(!bundle.value) bundle.value = 'com.soda.music';
+    wdaCard.classList.add('show');
+    refreshWda();
+  }else{
+    wdaCard.classList.remove('show');
   }
   document.getElementById('cfgHint').textContent = ios
-    ? 'iPhone：USB 插线 → 信任电脑 → 开启开发者模式。iOS 17.4+ 免签直连，不装证书。'
+    ? 'iPhone：iOS 27+ 免签直连；iOS 17–26.x 点兼容卡片，一键安装并启动 WDA。'
     : 'Android：插 USB → 点「读取 Android 手机」→「保存参数」，坐标按比例算。';
   document.getElementById('cfgPlatformLabel').textContent = ios ? 'iPhone · USB' : 'Android · ADB';
   document.getElementById('cfRead').textContent = ios ? '读取 iPhone' : '读取 Android 手机';
@@ -2227,6 +2462,253 @@ loadProfile().then(p => {
     setTimeout(() => readDevice(true), 650);
 });
 /* ================= 机型参数结束 ================= */
+/* ================= 旧版 iPhone WDA ================= */
+const wdaStateLabels = {
+  ready:['已就绪','ok'],
+  expired:['需续签','err'],
+  no_account:['需登录','warn'],
+  not_installed:['需安装','warn'],
+  stopped:['待启动',''],
+  unsupported:['不支持','err'],
+  coredevice:['免签直连','ok'],
+  unknown:['待读取','']
+};
+
+function wdaStateView(st){
+  st = st || {};
+  const item = wdaStateLabels[st.state] || ['待检查',''];
+  return {label:item[0], level:item[1]};
+}
+
+function renderWdaCard(st){
+  if(!st || typeof st !== 'object') return;
+  wdaStatus = st;
+  const ios = currentPlatform === 'ios';
+  wdaCard.classList.toggle('show', ios);
+  if(!ios) return;
+
+  const mode = st.mode || 'unknown';
+  const view = wdaStateView(st);
+  wdaCard.classList.toggle('coredevice', mode === 'coredevice');
+  const title = document.getElementById('wdaCardTitle');
+  const sub = document.getElementById('wdaCardSub');
+  const copy = document.getElementById('wdaCardCopy');
+  const chip = document.getElementById('wdaCardChip');
+  const btn = document.getElementById('wdaCardBtn');
+
+  if(mode === 'coredevice'){
+    title.textContent = 'iPhone 免签直连';
+    sub.textContent = 'iOS ' + (st.ios || '27+') + ' · 无需安装 WDA';
+    copy.textContent = '这台 iPhone 可直接开始任务，不需要 Apple ID、证书或续签。';
+    chip.textContent = '免签直连';
+    chip.className = 'wda-chip ok';
+    btn.textContent = '无需配置';
+    return;
+  }
+  if(mode === 'unsupported'){
+    title.textContent = 'iPhone 系统版本过低';
+    sub.textContent = 'iOS ' + (st.ios || '?') + ' · 未纳入当前兼容范围';
+    copy.textContent = '当前版本支持 iOS 17.0 及以上；请先升级 iPhone 系统。';
+    chip.textContent = '不支持';
+    chip.className = 'wda-chip err';
+    btn.textContent = '查看兼容说明';
+    return;
+  }
+  if(mode === 'wda'){
+    title.textContent = '旧版 iPhone 兼容通道';
+    sub.textContent = 'iOS ' + (st.ios || '17–26') + ' · 免费签名约 7 天';
+    copy.textContent = st.busy
+      ? (st.step || '正在处理 WDA，请稍候…')
+      : (st.message || '点开后按向导安装并启动 WDA。');
+    chip.textContent = st.busy ? '处理中' : view.label;
+    chip.className = 'wda-chip ' + (st.busy ? 'warn' : view.level);
+    btn.textContent = st.running ? '查看 WDA 状态' : '打开 WDA 配置';
+    return;
+  }
+
+  title.textContent = 'iPhone 兼容模式';
+  sub.textContent = st.ios ? ('iOS ' + st.ios + ' · 等待检测') : '连接并读取 iPhone 后自动判断';
+  copy.textContent = st.message || 'iOS 27+ 免签直连；iOS 17–26 可在这里一键安装 WDA。';
+  chip.textContent = view.label;
+  chip.className = 'wda-chip ' + view.level;
+  btn.textContent = '打开兼容配置';
+}
+
+function renderWdaModal(st){
+  if(!st || typeof st !== 'object') return;
+  const locked = !!st.busy || wdaRequestBusy;
+  const mode = st.mode || 'unknown';
+  const view = wdaStateView(st);
+  const account = st.account_logged_in
+    ? ('已登录 ' + (st.account_masked || '')) : '未登录';
+  document.getElementById('wdaVersion').textContent =
+    st.ios ? ('iOS ' + st.ios) : '未读取';
+  document.getElementById('wdaAccount').textContent = account;
+  document.getElementById('wdaInstalled').textContent =
+    st.installed ? '已安装' : (mode === 'coredevice' ? '无需安装' : '未安装');
+  document.getElementById('wdaRunning').textContent =
+    st.running ? '已就绪' : '未启动';
+  document.getElementById('wdaInstalled').title = st.bundle_id || '';
+  let days = '尚未安装';
+  if(mode === 'coredevice') days = '无需签名';
+  else if(st.needs_resign) days = '已过期';
+  else if(st.days_left !== null && st.days_left !== undefined) days = '约 ' + st.days_left + ' 天';
+  else if(st.installed) days = '待检测';
+  document.getElementById('wdaDays').textContent = days;
+  document.getElementById('wdaDays').title = st.expires_at || '';
+  document.getElementById('wdaStep').textContent =
+    locked ? (st.step || '处理中…') : view.label;
+  document.getElementById('wdaStep').title = st.message || st.error || '';
+
+  const bar = document.getElementById('wdaProgress');
+  const fill = document.getElementById('wdaProgressBar');
+  const progress = (typeof st.progress === 'number') ? st.progress : null;
+  bar.classList.toggle('show', !!st.busy || progress !== null);
+  fill.style.width = Math.max(0, Math.min(100, progress === null ? 0 : progress)) + '%';
+
+  const install = document.getElementById('wdaInstall');
+  install.textContent = st.needs_resign ? '续签 WDA'
+    : (st.installed ? '重新安装 / 续签 WDA' : '安装 / 续签 WDA');
+  install.disabled = locked || mode === 'coredevice' || mode === 'unsupported';
+  document.getElementById('wdaLogin').disabled = locked || mode === 'coredevice';
+  document.getElementById('wdaCheck').disabled = locked;
+  document.getElementById('wdaStart').disabled =
+    locked || mode !== 'wda' || !st.installed || !!st.running || !!st.needs_resign;
+  document.getElementById('wdaStop').disabled = locked || mode !== 'wda' || !st.running;
+  document.getElementById('wdaLogout').disabled = locked;
+}
+
+async function refreshWda(force){
+  if(wdaFetchBusy) return;
+  if(!force && Date.now() - wdaFetchTs < 1600) return;
+  wdaFetchBusy = true;
+  wdaFetchTs = Date.now();
+  try{
+    const st = await j('/api/wda/status');
+    renderWdaCard(st);
+    renderWdaModal(st);
+  }catch(e){
+    if(wdaModal.classList.contains('show'))
+      wdaLogLine('读取 WDA 状态失败：' + (e.message || '未知错误'), 'error');
+  }finally{
+    wdaFetchBusy = false;
+  }
+}
+
+function wdaLogLine(text, level){
+  if(!wdaLog) return;
+  const stick = wdaLog.scrollHeight - wdaLog.scrollTop - wdaLog.clientHeight < 45;
+  const line = document.createElement('div');
+  if(level) line.className = level;
+  line.textContent = '[' + new Date().toLocaleTimeString('zh-CN', {hour12:false}) + '] ' + text;
+  wdaLog.appendChild(line);
+  while(wdaLog.childElementCount > 240) wdaLog.removeChild(wdaLog.firstChild);
+  if(stick) wdaLog.scrollTop = wdaLog.scrollHeight;
+}
+
+async function pullWdaLog(){
+  if(wdaLogBusy || !wdaModal.classList.contains('show')) return;
+  wdaLogBusy = true;
+  try{
+    const d = await j('/api/wda/log?since=' + wdaLogSince);
+    if(d.items && d.items.length){
+      for(const it of d.items) wdaLogLine(it[2], it[1]);
+    }
+    wdaLogSince = d.total;
+  }catch(e){
+  }finally{
+    wdaLogBusy = false;
+  }
+}
+
+function startWdaPolling(){
+  wdaLogSince = 0;
+  if(wdaLog) wdaLog.innerHTML = '';
+  refreshWda(true);
+  pullWdaLog();
+}
+
+function openWda(){
+  if(wdaStatus.mode === 'coredevice'){
+    cfgMsg('这台 iPhone 使用 iOS 27+ 免签直连，不需要安装 WDA', 'ok');
+    return;
+  }
+  const support = document.getElementById('supportModal');
+  if(support && support.classList.contains('show')) closeSupport();
+  wdaModal.classList.add('show');
+  document.body.style.overflow = 'hidden';
+  renderWdaModal(wdaStatus);
+  startWdaPolling();
+}
+
+function closeWda(){
+  wdaModal.classList.remove('show');
+  const support = document.getElementById('supportModal');
+  if(!support || !support.classList.contains('show'))
+    document.body.style.overflow = '';
+}
+
+function pollWda(){
+  if(!wdaModal.classList.contains('show')) return;
+  refreshWda(false);
+  pullWdaLog();
+}
+
+async function wdaAction(action){
+  if(wdaRequestBusy) return;
+  wdaRequestBusy = true;
+  renderWdaModal(wdaStatus);
+  try{
+    const d = await j('/api/wda/action', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action})
+    });
+    if(d.status){
+      wdaStatus = d.status;
+      renderWdaCard(d.status);
+      renderWdaModal(d.status);
+    }
+    if(action === 'check'){
+      cfgMsg('WDA 状态已刷新', 'ok');
+    }else if(action === 'login'){
+      cfgMsg('已打开 Impactor；登录完成后回到这里点「检查状态」', 'ok');
+    }else if(action === 'stop'){
+      cfgMsg('WDA 已停止', 'ok');
+    }else if(action === 'logout'){
+      cfgMsg('本机 Apple ID 登录信息已清除', 'ok');
+    }
+    setTimeout(() => refreshWda(true), 350);
+  }catch(e){
+    wdaLogLine(e.message || 'WDA 操作失败', 'error');
+    cfgMsg(e.message || 'WDA 操作失败', 'error');
+    setTimeout(() => refreshWda(true), 500);
+  }finally{
+    wdaRequestBusy = false;
+    renderWdaModal(wdaStatus);
+  }
+}
+
+wdaCard.addEventListener('click', openWda);
+wdaCard.addEventListener('keydown', e => {
+  if(e.key === 'Enter' || e.key === ' '){
+    e.preventDefault();
+    openWda();
+  }
+});
+document.getElementById('wdaClose').onclick = closeWda;
+document.getElementById('wdaInstall').onclick = () => wdaAction('install');
+document.getElementById('wdaLogin').onclick = () => wdaAction('login');
+document.getElementById('wdaStart').onclick = () => wdaAction('start');
+document.getElementById('wdaCheck').onclick = () => wdaAction('check');
+document.getElementById('wdaStop').onclick = () => wdaAction('stop');
+document.getElementById('wdaLogout').onclick = () => {
+  if(confirm('确定清除保存在本机的 Apple ID 登录信息？')) wdaAction('logout');
+};
+wdaModal.addEventListener('click', e => {
+  if(e.target === wdaModal) closeWda();
+});
+/* ================= 旧版 iPhone WDA 结束 ================= */
 /* ================= 支持 ================= */
 const supportModal = document.getElementById('supportModal');
 const qrStage = document.getElementById('qrStage');
@@ -2314,7 +2796,8 @@ function openSupport(mode){
 }
 function closeSupport(){
   supportModal.classList.remove('show');
-  document.body.style.overflow = '';
+  if(!wdaModal.classList.contains('show'))
+    document.body.style.overflow = '';
 }
 document.getElementById('supportBtn').onclick = () => openSupport('about');
 document.getElementById('supportContinue').onclick = closeSupport;
@@ -2322,7 +2805,8 @@ document.getElementById('supportClose').onclick = closeSupport;
 supportModal.addEventListener('click', e => { if(e.target === supportModal) closeSupport(); });
 document.addEventListener('keydown', e => {
   if(e.key !== 'Escape') return;
-  if(supportModal.classList.contains('show')) closeSupport();
+  if(wdaModal.classList.contains('show')) closeWda();
+  else if(supportModal.classList.contains('show')) closeSupport();
   else if(previewCard.classList.contains('zoomed')) setPreviewZoom(false);
 });
 
@@ -2398,8 +2882,11 @@ class Handler(BaseHTTPRequestHandler):
                 "clicks": S.clicks,
                 "rounds": S.rounds,
                 "device": S.device,
+                "wda_prompt": bool(S.wda_prompt),
+                "wda": WDA.peek() if q.PLATFORM == "ios" else None,
                 "settings": {"mute": bool(q.MUTE_ON_START),
                              "skip": bool(q.ENABLE_SKIP),
+                             "fast_ad": bool(q.AD_FAST_MODE),
                              "ocr_width": q.OCR_MAX_WIDTH},
                 "vip": {"days": vip_days(), "total": int(S.vip["total"]),
                         "per": int(S.vip["per"]), "cap": int(S.vip["cap"]),
@@ -2442,6 +2929,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, S.frame, "image/jpeg")
             return self._send(204, b"", "image/jpeg")
 
+        if path == "/api/wda/status":
+            deep = "deep=1" in self.path
+            status = WDA.status(device=dict(S.device or {}), deep=deep)
+            return self._send(200, json.dumps(status, ensure_ascii=False))
+
+        if path == "/api/wda/log":
+            since = 0
+            if "since=" in self.path:
+                try:
+                    since = int(self.path.split("since=")[1].split("&")[0])
+                except Exception:
+                    since = 0
+            total, items = WDA.snapshot_logs(since)
+            return self._send(200, json.dumps({"total": total, "items": items},
+                                              ensure_ascii=False))
+
         if path == "/api/support":
             return self._send(200, json.dumps({"ok": True, "slots": support_meta()},
                                               ensure_ascii=False))
@@ -2471,13 +2974,20 @@ class Handler(BaseHTTPRequestHandler):
             data = {}
 
         if path == "/api/start":
-            start_run()
-            return self._send(200, json.dumps({"ok": bool(S.running),
-                                               "running": bool(S.running)}))
+            result = start_run()
+            return self._send(200, json.dumps(result, ensure_ascii=False))
 
         if path == "/api/stop":
             stop_run()
             return self._send(200, json.dumps({"ok": True}))
+
+        if path == "/api/wda/action":
+            action = str(data.get("action") or "").strip().lower()
+            result = WDA.action(action, dict(S.device or {}))
+            if result.get("ok"):
+                S.wda_prompt = False
+            code = 200 if result.get("ok") else 400
+            return self._send(code, json.dumps(result, ensure_ascii=False))
 
         if path == "/api/settings":
             if "mute" in data:
@@ -2486,6 +2996,9 @@ class Handler(BaseHTTPRequestHandler):
             if "skip" in data:
                 q.ENABLE_SKIP = bool(data["skip"])
                 S.log(f"设置：允许跳过 = {'开' if q.ENABLE_SKIP else '关'}", "dim")
+            if "fast_ad" in data:
+                q.AD_FAST_MODE = bool(data["fast_ad"])
+                S.log(f"设置：广告极速 = {'开' if q.AD_FAST_MODE else '关'}", "dim")
             if "ocr_width" in data:
                 try:
                     q.OCR_MAX_WIDTH = max(600, min(1200, int(data["ocr_width"])))
@@ -2560,7 +3073,7 @@ def main():
 
     # ---- 环境自检：换电脑/换手机时，缺什么直接写在日志里 ----
     if q.PLATFORM == "ios":
-        S.log("平台：iPhone / USB 免签直连（iOS 17.4+）", "dim")
+        S.log("平台：iPhone / USB 免签直连（iOS 27.0+；低版本使用 WDA）", "dim")
     else:
         try:
             ap = q.adb_path()
@@ -2583,6 +3096,8 @@ def main():
                   f"  Build {S.device.get('build') or '?'}  {S.device.get('driver') or 'USB'}", "ok")
             if S.device.get("developer_mode") is False:
                 S.log("开发者模式未开启：进入「设置 → 隐私与安全性 → 开发者模式」开启并重启", "warn")
+            elif S.device.get("needs_wda"):
+                S.log(S.device.get("hint") or "iOS 26.x 及以下需要 WebDriverAgent 才能自动点击", "warn")
             elif not S.device.get("ready"):
                 S.log("iPhone 参数已读取。点「开始」会自动准备免签直连，首次可能需要几分钟", "info")
         else:

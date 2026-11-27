@@ -969,7 +969,15 @@ def adb(args, binary=False, timeout=20, serial=None):
         r = subprocess.run(cmd + args, capture_output=True, timeout=timeout, **_NOWIN)
         if r.returncode != 0:
             return None
-        return r.stdout if binary else r.stdout.decode("utf-8", "ignore")
+        out = r.stdout
+        # Android 多显示屏设备（如小米 17 Pro Max）的 screencap 会在 stdout 前
+        # 输出 "[Warning] Multiple displays were found..."，污染 PNG 二进制流，
+        # 导致 cv2.imdecode 返回 None。这里按 PNG magic 定位真正的图片起始位置。
+        if binary and out and any(str(a) == "screencap" for a in args):
+            idx = out.find(b"\x89PNG\r\n\x1a\n")
+            if idx > 0:
+                out = out[idx:]
+        return out if binary else out.decode("utf-8", "ignore")
     except Exception:
         return None
 
